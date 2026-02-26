@@ -81,6 +81,17 @@ class LifecycleTracker:
         self.calls.append("shutdown")
 
 
+def _make_vllm_config_mock():
+    """Create a VllmConfig mock with sane defaults for set_forward_context."""
+    vllm_config = MagicMock()
+    # set_forward_context checks these fields
+    vllm_config.parallel_config.data_parallel_size = 1
+    vllm_config.compilation_config.fast_moe_cold_start = False
+    vllm_config.compilation_config.static_forward_context = {}
+    vllm_config.speculative_config = None
+    return vllm_config
+
+
 def make_bridge_with_tracker():
     """Create a bridge with a LifecycleTracker as the connector."""
     from vllm_spyre.v1.worker.spyre_kv_connector_bridge import (
@@ -88,7 +99,7 @@ def make_bridge_with_tracker():
     )
 
     tracker = LifecycleTracker()
-    vllm_config = MagicMock()
+    vllm_config = _make_vllm_config_mock()
 
     bridge = SpyreKVConnectorBridge(vllm_config)
     # Inject the tracker as the connector
