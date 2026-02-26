@@ -736,6 +736,13 @@ class ChunkedPrefillModelRunner(
 
         self._make_block_ref_count()
 
+        # KV connector bridge — conditionally created based on feature flag
+        from vllm_spyre.v1.worker.spyre_kv_connector_bridge import (
+            maybe_create_bridge,
+        )
+
+        self._kv_bridge = maybe_create_bridge(vllm_config)
+
     def load_model(self) -> None:
         self._model = SpyreCausalLM(
             vllm_config=self.vllm_config,
@@ -1557,80 +1564,128 @@ class ChunkedPrefillModelRunner(
 
         self.update_states(scheduler_output)
 
+        # --- No-work path ---
         if not scheduler_output.total_num_scheduled_tokens:
-            # Return empty ModelRunnerOutput if there's no work to do.
+            # Let connector process transfers even without a forward pass
+            if self._kv_bridge is not None:
+                kv_output = self._kv_bridge.no_forward(scheduler_output)
+                if kv_output is not None and not kv_output.is_empty():
+                    import copy
+                    result = copy.copy(self.get_empty_output())
+                    result.kv_connector_output = kv_output
+                    return result
             return self.get_empty_output()
 
-        # Initialize internal request states if this is the first chunk of a very new prefill
-        self.maybe_setup_new_prefill(scheduler_output)
-        self._update_tracked_blocks()
-
-        model_input = self.prepare_model_input(scheduler_output)
-        is_prefill = model_input.is_prompt
-
-        # Execute the model
-        attn_metadata = self.build_attn_metadata(model_input)
-        # Embeddings take priority [used by multimodal models only]
-        input_ids_or_embeds = (
-            model_input.input_embeds
-            if model_input.input_embeds is not None
-            else model_input.input_tokens
+        # --- Begin connector lifecycle (if active) ---
+        bridge_active = (
+            self._kv_bridge is not None
+            and self._kv_bridge.begin_step(scheduler_output)
         )
-        with set_forward_context(attn_metadata, self.vllm_config):
-            logits = self.model(
-                input_ids_or_embeds=input_ids_or_embeds,
-                positions=model_input.input_positions,
-                masks=None,
-                is_prompt=model_input.is_prompt,
+
+        try:
+            # Initialize internal request states if this is the first chunk
+            # of a very new prefill
+            self.maybe_setup_new_prefill(scheduler_output)
+            self._update_tracked_blocks()
+
+            model_input = self.prepare_model_input(scheduler_output)
+            is_prefill = model_input.is_prompt
+
+            # Execute the model
+            attn_metadata = self.build_attn_metadata(model_input)
+            # Embeddings take priority [used by multimodal models only]
+            input_ids_or_embeds = (
+                model_input.input_embeds
+                if model_input.input_embeds is not None
+                else model_input.input_tokens
+            )
+            with set_forward_context(attn_metadata, self.vllm_config):
+                # Connector: bind metadata and start KV load (inside
+                # forward context so start_load_kv has valid context)
+                if bridge_active:
+                    self._kv_bridge.before_forward(scheduler_output)
+
+                logits = self.model(
+                    input_ids_or_embeds=input_ids_or_embeds,
+                    positions=model_input.input_positions,
+                    masks=None,
+                    is_prompt=model_input.is_prompt,
+                )
+
+            # Connector: collect results after forward
+            if bridge_active:
+                self._kv_bridge.after_forward(scheduler_output)
+
+            # If the prompt is being prefilled we don't have to sample
+            # and generate a new token.
+            if is_prefill and self.check_incomplete_prefill(scheduler_output):
+                # Only return outputs from the driver worker
+                if not self.is_driver_worker:
+                    return self.get_empty_output()
+
+                t1 = time.time() - t0
+                logger.debug(
+                    "t_forward_pass: %.2fms [prefill single chunk][batch size 1]",
+                    (t1 * 1000),
+                )
+                model_output = self.prefill_output()
+                if bridge_active:
+                    model_output.kv_connector_output = (
+                        self._kv_bridge.finish_step()
+                    )
+                return model_output
+
+            # Sample the next token.
+            output: SamplerOutput | None = self.model.sample(
+                logits=logits,
+                sampling_metadata=self.get_sampling_metadata(is_prefill),
+            )
+            assert output is not None, "Expected sampler output"
+
+            t1 = time.time() - t0
+            batch_size = model_input.input_tokens.shape[0]
+            step_type = "[prefill last chunk]" if is_prefill else "[decode]"
+            logger.debug(
+                "t_token: %.2fms %s[batch size %d]",
+                (t1 * 1000),
+                step_type,
+                batch_size,
             )
 
-        # If the prompt is being prefilled we don't have to sample
-        # and generate a new token.
-        if is_prefill and self.check_incomplete_prefill(scheduler_output):
+            # Get the right batch, if this is the last chunk to conclude the
+            # prefill, we'll generate a token and we should get from the
+            # prefill batch because input_batch may have other request that
+            # were not processed at this step.
+            batch = self.prefill_batch if is_prefill else self.input_batch
+
+            # Add the sampled token(s) to the request cache
+            req_ids = (
+                [r.req_id for r in scheduler_output.scheduled_new_reqs]
+                if len(scheduler_output.scheduled_new_reqs) > 0
+                else batch.sorted_requests_ids
+            )
+            sampled_ids = output.sampled_token_ids.tolist()
+
+            for i, req_id in enumerate(req_ids):
+                req_state = self.requests[req_id]
+                req_state.append_output_token_ids(sampled_ids[i])
+
             # Only return outputs from the driver worker
             if not self.is_driver_worker:
                 return self.get_empty_output()
 
-            t1 = time.time() - t0
-            logger.debug("t_forward_pass: %.2fms [prefill single chunk][batch size 1]", (t1 * 1000))
-            return self.prefill_output()
+            model_output = self.sampled_output(output, is_prefill)
+            if bridge_active:
+                model_output.kv_connector_output = (
+                    self._kv_bridge.finish_step()
+                )
+            return model_output
 
-        # Sample the next token.
-        output: SamplerOutput | None = self.model.sample(
-            logits=logits,
-            sampling_metadata=self.get_sampling_metadata(is_prefill),
-        )
-        assert output is not None, "Expected sampler output"
-
-        t1 = time.time() - t0
-        batch_size = model_input.input_tokens.shape[0]
-        step_type = "[prefill last chunk]" if is_prefill else "[decode]"
-        logger.debug("t_token: %.2fms %s[batch size %d]", (t1 * 1000), step_type, batch_size)
-
-        # Get the right batch, if this is the last chunk to conclude the
-        # prefill, we'll generate a token and we should get from the prefill
-        # batch because input_batch may have other request that are were
-        # not processed at this step.
-        batch = self.prefill_batch if is_prefill else self.input_batch
-
-        # Add the sampled token(s) to the request cache
-        req_ids = (
-            [r.req_id for r in scheduler_output.scheduled_new_reqs]
-            if len(scheduler_output.scheduled_new_reqs) > 0
-            else batch.sorted_requests_ids
-        )
-        sampled_ids = output.sampled_token_ids.tolist()
-
-        for i, req_id in enumerate(req_ids):
-            req_state = self.requests[req_id]
-            req_state.append_output_token_ids(sampled_ids[i])
-
-        # Only return outputs from the driver worker
-        if not self.is_driver_worker:
-            return self.get_empty_output()
-
-        model_output = self.sampled_output(output, is_prefill)
-        return model_output
+        except Exception:
+            # Ensure metadata is always cleared on error
+            if bridge_active:
+                self._kv_bridge.finish_step()
+            raise
 
     def prefill_output(self) -> SpyreModelRunnerOutput:
         req_id_to_index = self.get_req_id_to_index(is_prefill=True)

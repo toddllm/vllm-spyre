@@ -19,6 +19,11 @@ import vllm.envs as envs
 from huggingface_hub import hf_hub_download
 from vllm.config import VllmConfig
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    ensure_kv_transfer_shutdown,
+    has_kv_transfer_group,
+)
 from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -164,6 +169,7 @@ class SpyreWorker(WorkerBase):
             self._warmup_spyre_fixed_size(prompt_len, self.restricted_tokens, batch_size)
 
         self.model_runner.complete_warmup()
+        self._register_connector_kv_caches()
 
         all_warmup_end_t = time.time()
         all_warmup_total_t = all_warmup_end_t - all_warmup_start_t
@@ -180,6 +186,10 @@ class SpyreWorker(WorkerBase):
         """Basic health check (override for device-specific checks)."""
         # TODO: Implement something!
         return
+
+    def shutdown(self) -> None:
+        """Clean up KV transfer resources on worker shutdown."""
+        ensure_kv_transfer_shutdown()
 
     def determine_available_memory(self) -> int:
         """Return available device memory in bytes.
@@ -220,7 +230,61 @@ class SpyreWorker(WorkerBase):
     def initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None:
         """Construct the KV cache from the provided configs.
         Currently, we do not support paged attention or kv caching"""
-        pass
+        # Initialize KV connector if configured. The connector may need
+        # kv_cache_config, so this runs after cache config is available.
+        if kv_cache_configs:
+            ensure_kv_transfer_initialized(
+                self.vllm_config, kv_cache_config=kv_cache_configs[0]
+            )
+        else:
+            ensure_kv_transfer_initialized(self.vllm_config)
+
+    def _register_connector_kv_caches(self) -> None:
+        """Register KV caches with the connector after final warmup allocation.
+
+        Must be called after complete_warmup() since warmup reallocates
+        past_key_value_states tensors. Any earlier registration captures
+        stale references.
+        """
+        if not has_kv_transfer_group():
+            return
+
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            KVConnectorBase_V1,
+        )
+        from vllm.distributed.kv_transfer import get_kv_transfer_group
+
+        connector = get_kv_transfer_group()
+        if not isinstance(connector, KVConnectorBase_V1):
+            return
+
+        if not isinstance(self.model_runner, ChunkedPrefillModelRunner):
+            logger.debug(
+                "KV cache registration skipped: model runner is not "
+                "ChunkedPrefillModelRunner."
+            )
+            return
+
+        # Build kv_caches_dict from FMS past_key_value_states.
+        # FMS stores List[Tuple[K_tensor, V_tensor]] per layer.
+        # We pass them keyed by upstream layer naming convention.
+        kv_caches = getattr(self.model_runner.model, "past_key_value_states", None)
+        if kv_caches is None:
+            logger.warning(
+                "Cannot register KV caches: past_key_value_states is None."
+            )
+            return
+
+        kv_caches_dict: dict[str, torch.Tensor] = {}
+        for layer_idx, (k_cache, v_cache) in enumerate(kv_caches):
+            layer_name = f"model.layers.{layer_idx}.self_attn"
+            # Stack K and V into [2, ...] to match upstream convention
+            kv_caches_dict[layer_name] = torch.stack([k_cache, v_cache])
+
+        connector.register_kv_caches(kv_caches_dict)
+        logger.info(
+            "Registered %d KV cache layers with connector.", len(kv_caches_dict)
+        )
 
     def __init__(
         self,
@@ -529,6 +593,7 @@ class SpyreWorker(WorkerBase):
         self._cleanup_model_runner(request=[deploy_req])
 
         model_runner.complete_warmup()
+        self._register_connector_kv_caches()
 
         warmup_end_t = time.time()
         warmup_total_t = warmup_end_t - warmup_start_t
