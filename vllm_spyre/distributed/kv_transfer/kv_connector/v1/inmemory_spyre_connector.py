@@ -17,6 +17,7 @@ register_kv_caches(). The model runner owns FMS<->staging sync.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -70,6 +71,32 @@ def reset_global_store() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Scheduler-side saved-request registry
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class _SavedRequest:
+    """Record of a request whose KV was saved for potential reuse.
+
+    Stored on the scheduler-side connector instance so that
+    get_num_new_matched_tokens can find prefix matches.
+    """
+    req_id: str
+    prompt_token_ids: tuple[int, ...]
+    block_ids: list[int]
+    num_tokens: int
+
+
+@dataclass(frozen=True)
+class _PendingLoadSource:
+    """Per-step match context captured by get_num_new_matched_tokens()."""
+
+    source: _SavedRequest
+    matched_tokens_total: int
+    num_local_computed_tokens: int
+
+
+# ---------------------------------------------------------------------------
 # InMemorySpyreConnector
 # ---------------------------------------------------------------------------
 
@@ -108,6 +135,14 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
 
         # Scheduler-side per-step state (reset in build_connector_meta)
         self._pending_requests: list[SpyreConnectorRequestMeta] = []
+
+        # Scheduler-side saved-request registry for prefix reuse.
+        # Maps req_id -> _SavedRequest for requests whose KV was saved.
+        self._saved_requests: dict[str, _SavedRequest] = {}
+
+        # Per-step: maps request_id -> match context for load requests
+        # that were matched in get_num_new_matched_tokens this step.
+        self._pending_load_sources: dict[str, _PendingLoadSource] = {}
 
         # Worker-side: registered staging KV caches
         # These are the [2, ...] staging tensors keyed by layer name.
@@ -376,12 +411,80 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         request: Request,
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
-        """Conservative token matching: returns 0 for now.
+        """Exact-prefix, block-aligned token matching.
 
-        A production implementation would check the store for a
-        block-aligned prefix match. This returns 0 to ensure no
-        over-reporting. Cross-request prefix reuse is a Phase 3 feature.
+        Searches the saved-request registry for a request whose prompt
+        is an exact prefix of this request's prompt. Returns the
+        block-aligned token count of the longest such prefix.
+
+        Side-effect free: may be called multiple times for the same
+        request. The match is recorded in _pending_load_sources only
+        if this is the first call for this request_id.
+
+        Returns:
+            (num_matched_tokens, is_async):
+              - num_matched_tokens: block-aligned count, or 0 if no match
+              - is_async: always False (synchronous loading)
         """
+        prompt = request.prompt_token_ids
+        if not prompt or not self._saved_requests:
+            self._pending_load_sources.pop(request.request_id, None)
+            return 0, False
+
+        prompt_tuple = tuple(prompt)
+        best_match: _SavedRequest | None = None
+        best_tokens_total = 0
+
+        for saved in self._saved_requests.values():
+            saved_len = len(saved.prompt_token_ids)
+            if saved_len == 0:
+                continue
+
+            # Compute common prefix length between saved and new prompts.
+            # Either saved is a prefix of new, or new is a prefix of saved,
+            # or they share a common prefix that's shorter than both.
+            common_len = min(saved_len, len(prompt_tuple))
+            if prompt_tuple[:common_len] != saved.prompt_token_ids[:common_len]:
+                continue
+
+            # Block-align: round down to block_size boundary
+            aligned = (common_len // self._block_size) * self._block_size
+            if aligned == 0:
+                continue
+
+            if aligned > best_tokens_total:
+                best_tokens_total = aligned
+                best_match = saved
+
+        if best_match is not None and best_tokens_total > 0:
+            # Return only the additional tokens beyond what is already local.
+            # Keep this conservative and block-aligned to avoid over-reporting.
+            num_local = max(0, num_computed_tokens)
+            num_external = max(0, best_tokens_total - num_local)
+            num_external = (num_external // self._block_size) * self._block_size
+
+            if num_external == 0:
+                self._pending_load_sources.pop(request.request_id, None)
+                return 0, False
+
+            # Record match context for update_state_after_alloc.
+            self._pending_load_sources[request.request_id] = _PendingLoadSource(
+                source=best_match,
+                matched_tokens_total=best_tokens_total,
+                num_local_computed_tokens=num_local,
+            )
+            logger.debug(
+                "[InMemorySpyreConnector] get_num_new_matched_tokens: "
+                "req=%s matched source=%s, total=%d, local=%d, external=%d",
+                request.request_id,
+                best_match.req_id,
+                best_tokens_total,
+                num_local,
+                num_external,
+            )
+            return num_external, False
+
+        self._pending_load_sources.pop(request.request_id, None)
         return 0, False
 
     # ------------------------------------------------------------------
@@ -394,7 +497,15 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         blocks: KVCacheBlocks,
         num_external_tokens: int,
     ) -> None:
-        """Record block allocation for this request."""
+        """Record block allocation for this request.
+
+        When num_external_tokens > 0, the scheduler matched a prefix via
+        get_num_new_matched_tokens. We produce a load request with the
+        source_req_id and block_mapping from source blocks to dest blocks.
+
+        When num_external_tokens == 0, this is a normal prefill: produce
+        a store request.
+        """
         block_id_lists = blocks.get_block_ids() if blocks is not None else ()
 
         # Single KV cache group assertion
@@ -408,15 +519,62 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         for group in block_id_lists:
             flat_block_ids.extend(group)
 
-        req_meta = SpyreConnectorRequestMeta(
-            req_id=request.request_id,
-            block_ids=flat_block_ids,
-            is_store=(num_external_tokens == 0),
-            token_count=(
-                num_external_tokens if num_external_tokens > 0
-                else len(request.all_token_ids)
-            ),
-        )
+        if num_external_tokens > 0:
+            # Load path: produce load request with block mapping
+            pending = self._pending_load_sources.get(request.request_id)
+            if pending is None:
+                logger.warning(
+                    "[InMemorySpyreConnector] update_state_after_alloc: "
+                    "num_external_tokens=%d but no source found for req=%s. "
+                    "Falling back to store request.",
+                    num_external_tokens, request.request_id,
+                )
+                req_meta = SpyreConnectorRequestMeta(
+                    req_id=request.request_id,
+                    block_ids=flat_block_ids,
+                    is_store=True,
+                    token_count=len(request.all_token_ids),
+                )
+            else:
+                # Compute how many blocks the external tokens cover
+                num_external_blocks = num_external_tokens // self._block_size
+                local_blocks = (
+                    pending.num_local_computed_tokens // self._block_size
+                )
+                source = pending.source
+
+                # Build block mapping: source_block_id -> dest_block_id.
+                # External blocks start after local-computed blocks in both
+                # source and destination block lists.
+                block_mapping: list[tuple[int, int]] = []
+                for i in range(num_external_blocks):
+                    src_idx = local_blocks + i
+                    dest_idx = local_blocks + i
+                    if src_idx >= len(source.block_ids):
+                        break
+                    if dest_idx >= len(flat_block_ids):
+                        break
+                    src_block_id = source.block_ids[src_idx]
+                    dest_block_id = flat_block_ids[dest_idx]
+                    block_mapping.append((src_block_id, dest_block_id))
+
+                req_meta = SpyreConnectorRequestMeta(
+                    req_id=request.request_id,
+                    block_ids=flat_block_ids,
+                    is_store=False,
+                    token_count=num_external_tokens,
+                    source_req_id=source.req_id,
+                    block_mapping=block_mapping,
+                )
+        else:
+            # Store path: normal prefill
+            req_meta = SpyreConnectorRequestMeta(
+                req_id=request.request_id,
+                block_ids=flat_block_ids,
+                is_store=True,
+                token_count=len(request.all_token_ids),
+            )
+
         self._pending_requests.append(req_meta)
 
         logger.debug(
@@ -447,6 +605,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
 
         # Reset per-step state
         self._pending_requests.clear()
+        self._pending_load_sources.clear()
 
         return meta
 
@@ -457,13 +616,32 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
     ) -> tuple[bool, dict[str, Any] | None]:
         """Called when a request finishes generating.
 
-        Keeps KV data in the store for potential future reuse.
-        Returns (False, None) — blocks can be freed immediately.
+        Records the request's prompt and block info in the saved-request
+        registry so that future requests with matching prefixes can reuse
+        the KV data. Returns (False, None) — blocks can be freed
+        immediately (the KV data lives in the in-memory store, not in
+        the block manager's live blocks).
         """
-        logger.debug(
-            "[InMemorySpyreConnector] request_finished: req=%s, %d blocks",
-            request.request_id, len(block_ids),
-        )
+        prompt = request.prompt_token_ids
+        if prompt and block_ids:
+            saved = _SavedRequest(
+                req_id=request.request_id,
+                prompt_token_ids=tuple(prompt),
+                block_ids=list(block_ids),
+                num_tokens=len(prompt),
+            )
+            self._saved_requests[request.request_id] = saved
+            logger.debug(
+                "[InMemorySpyreConnector] request_finished: req=%s saved "
+                "(%d tokens, %d blocks) for reuse",
+                request.request_id, len(prompt), len(block_ids),
+            )
+        else:
+            logger.debug(
+                "[InMemorySpyreConnector] request_finished: req=%s, "
+                "%d blocks (not saved — no prompt or blocks)",
+                request.request_id, len(block_ids),
+            )
         return False, None
 
     # ------------------------------------------------------------------
