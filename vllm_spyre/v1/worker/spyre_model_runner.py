@@ -29,7 +29,12 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput, SamplerOutput
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+    SamplerOutput,
+)
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.request import Request
 
@@ -742,12 +747,58 @@ class ChunkedPrefillModelRunner(
         )
 
         self._kv_bridge = maybe_create_bridge(vllm_config)
+        # Optional KV connector staging buffers keyed by layer name.
+        # These are populated by the worker once warmup has finalized the
+        # FMS past_key_value_states allocation.
+        self._connector_kv_staging: dict[str, torch.Tensor] | None = None
+        self._connector_kv_pairs: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None
 
     def load_model(self) -> None:
         self._model = SpyreCausalLM(
             vllm_config=self.vllm_config,
             rank=self.rank,
         )
+
+    def set_connector_kv_cache_staging(
+        self,
+        kv_staging: dict[str, torch.Tensor],
+        kv_pairs: dict[str, tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        """Attach connector KV staging tensors and FMS K/V tensor pairs.
+
+        Args:
+            kv_staging: Layer-name keyed tensors with shape [2, ...], used by
+                KV connectors.
+            kv_pairs: Layer-name keyed (K, V) tensors used by FMS execution.
+        """
+        self._connector_kv_staging = kv_staging
+        self._connector_kv_pairs = kv_pairs
+
+    def _sync_loaded_kv_from_staging(self) -> None:
+        """Copy connector-loaded staging KV into FMS K/V tensors."""
+        if self._connector_kv_staging is None or self._connector_kv_pairs is None:
+            return
+
+        for layer_name, kv_tensor in self._connector_kv_staging.items():
+            kv_pair = self._connector_kv_pairs.get(layer_name)
+            if kv_pair is None:
+                continue
+            k_cache, v_cache = kv_pair
+            k_cache.copy_(kv_tensor[0])
+            v_cache.copy_(kv_tensor[1])
+
+    def _sync_fms_kv_to_staging(self) -> None:
+        """Copy current FMS K/V tensors into connector staging tensors."""
+        if self._connector_kv_staging is None or self._connector_kv_pairs is None:
+            return
+
+        for layer_name, kv_pair in self._connector_kv_pairs.items():
+            kv_tensor = self._connector_kv_staging.get(layer_name)
+            if kv_tensor is None:
+                continue
+            k_cache, v_cache = kv_pair
+            kv_tensor[0].copy_(k_cache)
+            kv_tensor[1].copy_(v_cache)
 
     @property
     def vocab_size(self) -> int:
@@ -1581,6 +1632,14 @@ class ChunkedPrefillModelRunner(
             self._kv_bridge is not None
             and self._kv_bridge.begin_step(scheduler_output)
         )
+        bridge_finished = False
+
+        def _finalize_bridge() -> KVConnectorOutput | None:
+            nonlocal bridge_finished
+            if not bridge_active or bridge_finished:
+                return None
+            bridge_finished = True
+            return self._kv_bridge.finish_step()
 
         try:
             # Initialize internal request states if this is the first chunk
@@ -1604,6 +1663,10 @@ class ChunkedPrefillModelRunner(
                 # forward context so start_load_kv has valid context)
                 if bridge_active:
                     self._kv_bridge.before_forward(scheduler_output)
+                    # start_load_kv writes into connector staging buffers.
+                    # Propagate any loaded values into FMS K/V tensors before
+                    # forward executes.
+                    self._sync_loaded_kv_from_staging()
 
                 logits = self.model(
                     input_ids_or_embeds=input_ids_or_embeds,
@@ -1614,6 +1677,10 @@ class ChunkedPrefillModelRunner(
 
             # Connector: collect results after forward
             if bridge_active:
+                # FMS forward updates K/V through separate tensors. Mirror
+                # those updates into connector staging buffers before
+                # post-forward connector calls (save/wait/finished).
+                self._sync_fms_kv_to_staging()
                 self._kv_bridge.after_forward(scheduler_output)
 
             # If the prompt is being prefilled we don't have to sample
@@ -1621,6 +1688,7 @@ class ChunkedPrefillModelRunner(
             if is_prefill and self.check_incomplete_prefill(scheduler_output):
                 # Only return outputs from the driver worker
                 if not self.is_driver_worker:
+                    _finalize_bridge()
                     return self.get_empty_output()
 
                 t1 = time.time() - t0
@@ -1631,7 +1699,7 @@ class ChunkedPrefillModelRunner(
                 model_output = self.prefill_output()
                 if bridge_active:
                     model_output.kv_connector_output = (
-                        self._kv_bridge.finish_step()
+                        _finalize_bridge()
                     )
                 return model_output
 
@@ -1672,19 +1740,20 @@ class ChunkedPrefillModelRunner(
 
             # Only return outputs from the driver worker
             if not self.is_driver_worker:
+                _finalize_bridge()
                 return self.get_empty_output()
 
             model_output = self.sampled_output(output, is_prefill)
             if bridge_active:
                 model_output.kv_connector_output = (
-                    self._kv_bridge.finish_step()
+                    _finalize_bridge()
                 )
             return model_output
 
         except Exception:
             # Ensure metadata is always cleared on error
             if bridge_active:
-                self._kv_bridge.finish_step()
+                _finalize_bridge()
             raise
 
     def prefill_output(self) -> SpyreModelRunnerOutput:

@@ -276,10 +276,22 @@ class SpyreWorker(WorkerBase):
             return
 
         kv_caches_dict: dict[str, torch.Tensor] = {}
+        kv_cache_pairs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         for layer_idx, (k_cache, v_cache) in enumerate(kv_caches):
             layer_name = f"model.layers.{layer_idx}.self_attn"
-            # Stack K and V into [2, ...] to match upstream convention
+            # Build a connector-facing [2, ...] staging tensor and keep the
+            # original FMS K/V tensors for explicit synchronization in the
+            # model runner. `torch.stack` allocates new storage, so we cannot
+            # rely on aliasing.
             kv_caches_dict[layer_name] = torch.stack([k_cache, v_cache])
+            kv_cache_pairs[layer_name] = (k_cache, v_cache)
+
+        # The model runner uses these maps to synchronize connector staging
+        # tensors <-> FMS K/V tensors around each bridge-managed step.
+        self.model_runner.set_connector_kv_cache_staging(
+            kv_staging=kv_caches_dict,
+            kv_pairs=kv_cache_pairs,
+        )
 
         connector.register_kv_caches(kv_caches_dict)
         logger.info(
