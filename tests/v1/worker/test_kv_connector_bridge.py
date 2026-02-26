@@ -14,6 +14,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -384,3 +385,32 @@ class TestOutputPropagation:
 
         assert output is not None
         assert output.finished_recving == {"req-1"}
+
+
+@pytest.mark.cpu
+class TestConnectorKVStagingSync:
+    """Verify staging<->FMS KV synchronization helpers are correct."""
+
+    def test_sync_fms_to_staging_and_back(self):
+        from vllm_spyre.v1.worker.spyre_model_runner import ChunkedPrefillModelRunner
+
+        runner = object.__new__(ChunkedPrefillModelRunner)
+
+        k_cache = torch.zeros((2, 3), dtype=torch.float32)
+        v_cache = torch.ones((2, 3), dtype=torch.float32)
+        staging = torch.empty((2, 2, 3), dtype=torch.float32)
+
+        runner.set_connector_kv_cache_staging(
+            kv_staging={"model.layers.0.self_attn": staging},
+            kv_pairs={"model.layers.0.self_attn": (k_cache, v_cache)},
+        )
+
+        runner._sync_fms_kv_to_staging()
+        assert torch.equal(staging[0], k_cache)
+        assert torch.equal(staging[1], v_cache)
+
+        staging[0].fill_(7.0)
+        staging[1].fill_(9.0)
+        runner._sync_loaded_kv_from_staging()
+        assert torch.equal(k_cache, torch.full_like(k_cache, 7.0))
+        assert torch.equal(v_cache, torch.full_like(v_cache, 9.0))
