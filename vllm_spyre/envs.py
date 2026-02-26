@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     VLLM_SPYRE_NUM_CPUS: int = 0
     VLLM_SPYRE_REQUIRE_KNOWN_CONFIG: bool = False
     VLLM_SPYRE_MODEL_CONFIG_FILE: str | None = None
+    VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE: bool = False
 
 logger = init_logger(__name__)
 
@@ -132,6 +133,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Path to custom model_configs.yaml file. If not set, uses the default
     # location at vllm_spyre/config/model_configs.yaml
     "VLLM_SPYRE_MODEL_CONFIG_FILE": lambda: os.getenv("VLLM_SPYRE_MODEL_CONFIG_FILE"),
+    # Enable the KV connector bridge for lifecycle integration.
+    # When enabled, the Spyre model runner drives connector bind/load/save/
+    # finish phases around the FMS forward pass. Requires a KV connector
+    # to be configured via --kv-connector. Disabled by default.
+    "VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE": lambda: bool(
+        int(os.getenv("VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE", "0"))
+    ),
 }
 # --8<-- [end:env-vars-definition]
 
