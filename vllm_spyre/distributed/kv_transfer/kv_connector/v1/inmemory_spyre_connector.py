@@ -34,7 +34,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
     KVConnectorStats,
+    PromMetric,
+    PromMetricT,
 )
 
 from vllm_spyre.distributed.kv_transfer.kv_connector.v1.metadata import (
@@ -105,6 +108,109 @@ class _PendingLoadSource:
     source: _SavedRequest
     matched_tokens_total: int
     num_local_computed_tokens: int
+
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics adapter
+# ---------------------------------------------------------------------------
+
+class SpyreConnectorPromMetrics(KVConnectorPromMetrics):
+    """Prometheus metrics for the InMemorySpyreConnector.
+
+    Registers per-engine counters for KV connector operations.
+    """
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ):
+        super().__init__(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues,
+        )
+
+        # Counters — monotonically increasing totals.
+        counter_matched_tokens = self._counter_cls(
+            name="vllm:spyre_kv_matched_tokens_total",
+            documentation=(
+                "Total tokens matched for KV reuse by the Spyre connector."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_matched_tokens = self.make_per_engine(
+            counter_matched_tokens,
+        )
+
+        counter_loaded_blocks = self._counter_cls(
+            name="vllm:spyre_kv_loaded_blocks_total",
+            documentation=(
+                "Total KV blocks loaded from the store by the Spyre connector."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_loaded_blocks = self.make_per_engine(
+            counter_loaded_blocks,
+        )
+
+        counter_saved_blocks = self._counter_cls(
+            name="vllm:spyre_kv_saved_blocks_total",
+            documentation=(
+                "Total KV blocks saved to the store by the Spyre connector."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_saved_blocks = self.make_per_engine(
+            counter_saved_blocks,
+        )
+
+        counter_load_misses = self._counter_cls(
+            name="vllm:spyre_kv_load_misses_total",
+            documentation=(
+                "Total KV block load misses (missing data in store)."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_load_misses = self.make_per_engine(counter_load_misses)
+
+        counter_evictions = self._counter_cls(
+            name="vllm:spyre_kv_evictions_total",
+            documentation=(
+                "Total saved-request registry evictions (LRU)."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_evictions = self.make_per_engine(counter_evictions)
+
+        counter_match_attempts = self._counter_cls(
+            name="vllm:spyre_kv_match_attempts_total",
+            documentation=(
+                "Total prefix match attempts by the Spyre connector."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_match_attempts = self.make_per_engine(
+            counter_match_attempts,
+        )
+
+    def observe(
+        self,
+        transfer_stats_data: dict[str, Any],
+        engine_idx: int = 0,
+    ) -> None:
+        """Map SpyreConnectorStats data dict to Prometheus counters."""
+        for prom_counter, key in [
+            (self.counter_matched_tokens, "matched_tokens"),
+            (self.counter_loaded_blocks, "loaded_blocks"),
+            (self.counter_saved_blocks, "saved_blocks"),
+            (self.counter_load_misses, "load_misses"),
+            (self.counter_evictions, "evictions"),
+            (self.counter_match_attempts, "match_attempts"),
+        ]:
+            value = transfer_stats_data.get(key, 0)
+            if value > 0:
+                prom_counter[engine_idx].inc(value)
 
 
 # ---------------------------------------------------------------------------
@@ -811,6 +917,19 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         if data is not None:
             return SpyreConnectorStats(data=data)
         return SpyreConnectorStats()
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        """Create Prometheus metrics for this connector."""
+        return SpyreConnectorPromMetrics(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues,
+        )
 
     def get_cumulative_metrics(self) -> dict[str, int]:
         """Return lifetime cumulative metrics (for testing/inspection)."""

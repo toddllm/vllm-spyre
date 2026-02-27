@@ -9,7 +9,6 @@ Validates:
 """
 
 import multiprocessing
-import os
 import tempfile
 from unittest.mock import MagicMock, patch
 
@@ -29,7 +28,6 @@ from vllm_spyre.distributed.kv_transfer.kv_connector.v1.metadata import (
     KVKind,
     SpyreConnectorMeta,
     SpyreConnectorRequestMeta,
-    SpyreConnectorStats,
     StoreKey,
 )
 from vllm_spyre.v1.worker.spyre_kv_connector_bridge import (
@@ -331,7 +329,6 @@ class TestAsyncLayerPipeline:
     def test_async_load_produces_same_results_as_sync(self):
         """Async path loads same data as sync path."""
         store = InMemoryKVStore()
-        prompt = [1, 2, 3, 4, 5, 6, 7, 8]
 
         # --- Sync save ---
         sync_conn = _make_connector(
@@ -1131,3 +1128,292 @@ class TestStricterValidation:
             )],
         )
         meta.validate()  # Should not raise
+
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics adapter
+# ---------------------------------------------------------------------------
+
+class _FakeMetricChild:
+    """Stand-in for a labeled prometheus_client metric child (.labels())."""
+
+    def __init__(self):
+        self._value: float = 0.0
+
+    def inc(self, amount: float = 1) -> None:
+        self._value += amount
+
+    def set(self, value: float) -> None:
+        self._value = value
+
+    def observe(self, amount: float) -> None:
+        self._value += amount
+
+
+class _FakeMetric:
+    """Stand-in for a prometheus_client Counter/Gauge/Histogram."""
+
+    def __init__(self, name="", documentation="", labelnames=None):
+        self.name = name
+        self.documentation = documentation
+        self.labelnames = labelnames or []
+        self._children: dict[tuple, _FakeMetricChild] = {}
+
+    def labels(self, *args):
+        key = args
+        if key not in self._children:
+            self._children[key] = _FakeMetricChild()
+        return self._children[key]
+
+
+def _make_fake_metric_types():
+    """Return a metric_types dict compatible with KVConnectorPromMetrics."""
+    from prometheus_client import Counter, Gauge, Histogram
+    return {
+        Counter: _FakeMetric,
+        Gauge: _FakeMetric,
+        Histogram: _FakeMetric,
+    }
+
+
+@pytest.mark.cpu
+class TestPrometheusAdapter:
+    """Verify SpyreConnectorPromMetrics and build_prom_metrics()."""
+
+    def test_build_prom_metrics_returns_adapter(self):
+        """build_prom_metrics() returns a SpyreConnectorPromMetrics instance."""
+        from vllm_spyre.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector import (
+            SpyreConnectorPromMetrics,
+        )
+
+        cfg = _make_vllm_config_mock()
+        metric_types = _make_fake_metric_types()
+        labelnames = ["engine"]
+        per_engine_labelvalues = {0: ["engine_0"]}
+
+        result = InMemorySpyreConnector.build_prom_metrics(
+            cfg, metric_types, labelnames, per_engine_labelvalues,
+        )
+        assert isinstance(result, SpyreConnectorPromMetrics)
+
+    def test_adapter_has_all_six_counters(self):
+        """Adapter exposes all 6 expected counter attributes."""
+        cfg = _make_vllm_config_mock()
+        metric_types = _make_fake_metric_types()
+        labelnames = ["engine"]
+        per_engine_labelvalues = {0: ["engine_0"]}
+
+        adapter = InMemorySpyreConnector.build_prom_metrics(
+            cfg, metric_types, labelnames, per_engine_labelvalues,
+        )
+
+        expected_attrs = [
+            "counter_matched_tokens",
+            "counter_loaded_blocks",
+            "counter_saved_blocks",
+            "counter_load_misses",
+            "counter_evictions",
+            "counter_match_attempts",
+        ]
+        for attr in expected_attrs:
+            assert hasattr(adapter, attr), f"Missing attribute: {attr}"
+            # Each should be a per-engine dict with engine_idx 0
+            counter_dict = getattr(adapter, attr)
+            assert 0 in counter_dict
+
+    def test_observe_increments_counters(self):
+        """observe() maps stats keys to the correct Prometheus counters."""
+        cfg = _make_vllm_config_mock()
+        metric_types = _make_fake_metric_types()
+        labelnames = ["engine"]
+        per_engine_labelvalues = {0: ["engine_0"]}
+
+        adapter = InMemorySpyreConnector.build_prom_metrics(
+            cfg, metric_types, labelnames, per_engine_labelvalues,
+        )
+
+        stats_data = {
+            "matched_tokens": 10,
+            "loaded_blocks": 5,
+            "saved_blocks": 3,
+            "load_misses": 1,
+            "evictions": 2,
+            "match_attempts": 7,
+        }
+        adapter.observe(stats_data, engine_idx=0)
+
+        assert adapter.counter_matched_tokens[0]._value == 10
+        assert adapter.counter_loaded_blocks[0]._value == 5
+        assert adapter.counter_saved_blocks[0]._value == 3
+        assert adapter.counter_load_misses[0]._value == 1
+        assert adapter.counter_evictions[0]._value == 2
+        assert adapter.counter_match_attempts[0]._value == 7
+
+    def test_observe_skips_zero_values(self):
+        """observe() does not call inc() for zero-valued counters."""
+        cfg = _make_vllm_config_mock()
+        metric_types = _make_fake_metric_types()
+        labelnames = ["engine"]
+        per_engine_labelvalues = {0: ["engine_0"]}
+
+        adapter = InMemorySpyreConnector.build_prom_metrics(
+            cfg, metric_types, labelnames, per_engine_labelvalues,
+        )
+
+        # All zeros — none should increment
+        adapter.observe({"matched_tokens": 0, "loaded_blocks": 0}, engine_idx=0)
+
+        assert adapter.counter_matched_tokens[0]._value == 0
+        assert adapter.counter_loaded_blocks[0]._value == 0
+
+    def test_observe_accumulates_across_calls(self):
+        """Multiple observe() calls accumulate counter values."""
+        cfg = _make_vllm_config_mock()
+        metric_types = _make_fake_metric_types()
+        labelnames = ["engine"]
+        per_engine_labelvalues = {0: ["engine_0"]}
+
+        adapter = InMemorySpyreConnector.build_prom_metrics(
+            cfg, metric_types, labelnames, per_engine_labelvalues,
+        )
+
+        adapter.observe({"matched_tokens": 5}, engine_idx=0)
+        adapter.observe({"matched_tokens": 3}, engine_idx=0)
+        assert adapter.counter_matched_tokens[0]._value == 8
+
+    def test_observe_handles_missing_keys(self):
+        """observe() gracefully handles stats dict with missing keys."""
+        cfg = _make_vllm_config_mock()
+        metric_types = _make_fake_metric_types()
+        labelnames = ["engine"]
+        per_engine_labelvalues = {0: ["engine_0"]}
+
+        adapter = InMemorySpyreConnector.build_prom_metrics(
+            cfg, metric_types, labelnames, per_engine_labelvalues,
+        )
+
+        # Only one key present — others default to 0
+        adapter.observe({"saved_blocks": 4}, engine_idx=0)
+
+        assert adapter.counter_saved_blocks[0]._value == 4
+        assert adapter.counter_matched_tokens[0]._value == 0
+        assert adapter.counter_loaded_blocks[0]._value == 0
+
+    def test_multi_engine_observe(self):
+        """observe() routes metrics to the correct engine index."""
+        cfg = _make_vllm_config_mock()
+        metric_types = _make_fake_metric_types()
+        labelnames = ["engine"]
+        per_engine_labelvalues = {
+            0: ["engine_0"],
+            1: ["engine_1"],
+        }
+
+        adapter = InMemorySpyreConnector.build_prom_metrics(
+            cfg, metric_types, labelnames, per_engine_labelvalues,
+        )
+
+        adapter.observe({"loaded_blocks": 10}, engine_idx=0)
+        adapter.observe({"loaded_blocks": 20}, engine_idx=1)
+
+        assert adapter.counter_loaded_blocks[0]._value == 10
+        assert adapter.counter_loaded_blocks[1]._value == 20
+
+
+# ---------------------------------------------------------------------------
+# Runtime metrics smoke test: reuse flow produces non-zero stats
+# ---------------------------------------------------------------------------
+
+@pytest.mark.cpu
+class TestMetricsSmokeTest:
+    """End-to-end: run a reuse flow and verify stats feed into adapter."""
+
+    def test_reuse_flow_produces_nonzero_metrics(self):
+        """Save + load flow: connector stats feed into prom adapter."""
+        store = InMemoryKVStore()
+        conn = _make_connector(block_size=4, store=store)
+        staging = _make_staging_caches(num_layers=2, num_blocks=8)
+        conn.register_kv_caches(staging)
+
+        # --- Step 1: Save KV for req-A ---
+        for layer in staging:
+            staging[layer][0][0].fill_(1.0)
+            staging[layer][1][0].fill_(2.0)
+
+        save_meta = SpyreConnectorMeta(
+            requests=[SpyreConnectorRequestMeta(
+                req_id="req-A", block_ids=[0],
+                is_store=True, token_count=4,
+            )],
+            layer_names=sorted(staging.keys()),
+            block_size=4,
+        )
+        conn.bind_connector_metadata(save_meta)
+        conn.wait_for_save()
+
+        # Collect stats from save step
+        save_stats = conn.get_kv_connector_stats()
+        assert save_stats is not None
+        assert save_stats.data["saved_blocks"] > 0
+
+        conn.clear_connector_metadata()
+
+        # --- Step 2: Load KV for req-B from req-A ---
+        load_meta = SpyreConnectorMeta(
+            requests=[SpyreConnectorRequestMeta(
+                req_id="req-B", block_ids=[4],
+                is_store=False, source_req_id="req-A",
+                block_mapping=[(0, 4)],
+            )],
+            layer_names=sorted(staging.keys()),
+            block_size=4,
+        )
+        conn.bind_connector_metadata(load_meta)
+        conn.start_load_kv(MagicMock())
+
+        # Collect stats from load step
+        load_stats = conn.get_kv_connector_stats()
+        assert load_stats is not None
+        assert load_stats.data["loaded_blocks"] > 0
+
+        conn.clear_connector_metadata()
+
+        # --- Step 3: Scheduler-side match produces matched_tokens ---
+        sched_conn = _make_connector(block_size=4, store=store)
+        sched_conn.register_kv_caches(staging)
+
+        req_a = _make_request("req-A", [1, 2, 3, 4])
+        sched_conn.request_finished(req_a, [0])
+
+        req_b = _make_request("req-B", [1, 2, 3, 4])
+        matched, _ = sched_conn.get_num_new_matched_tokens(req_b, 0)
+        assert matched == 4
+
+        match_stats = sched_conn.get_kv_connector_stats()
+        assert match_stats is not None
+        assert match_stats.data["matched_tokens"] > 0
+        assert match_stats.data["match_attempts"] > 0
+
+        # --- Step 4: Feed all stats into prometheus adapter ---
+        cfg = _make_vllm_config_mock()
+        metric_types = _make_fake_metric_types()
+        labelnames = ["engine"]
+        per_engine_labelvalues = {0: ["engine_0"]}
+
+        adapter = InMemorySpyreConnector.build_prom_metrics(
+            cfg, metric_types, labelnames, per_engine_labelvalues,
+        )
+
+        # Feed save stats
+        adapter.observe(save_stats.data, engine_idx=0)
+        # Feed load stats
+        adapter.observe(load_stats.data, engine_idx=0)
+        # Feed match stats
+        adapter.observe(match_stats.data, engine_idx=0)
+
+        # Verify non-zero metrics in the adapter
+        assert adapter.counter_saved_blocks[0]._value > 0
+        assert adapter.counter_loaded_blocks[0]._value > 0
+        assert adapter.counter_matched_tokens[0]._value > 0
+        assert adapter.counter_match_attempts[0]._value > 0
+        assert adapter.counter_load_misses[0]._value == 0
