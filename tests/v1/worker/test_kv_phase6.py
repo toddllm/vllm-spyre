@@ -87,7 +87,7 @@ def _make_connector(block_size=4, store=None, **env_overrides):
     """Create a connector with optional env overrides."""
     env = {
         "VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE": "1024",
-        "VLLM_SPYRE_MAX_LOAD_PROCESSES": "0",
+        "VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS": "0",
     }
     env.update(env_overrides)
     with patch.dict("os.environ", env), patch("vllm_spyre.envs._cache", {}):
@@ -169,7 +169,7 @@ def _prefill_worker(export_dir, result_queue):
         store = InMemoryKVStore()
         cfg = _make_vllm_config_mock(block_size=4)
         with patch.dict("os.environ", {
-            "VLLM_SPYRE_MAX_LOAD_PROCESSES": "0",
+            "VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS": "0",
         }), patch("vllm_spyre.envs._cache", {}):
             connector = InMemorySpyreConnector(
                 vllm_config=cfg, role=KVConnectorRole.WORKER,
@@ -219,7 +219,7 @@ def _decode_worker(export_dir, result_queue):
 
         cfg = _make_vllm_config_mock(block_size=4)
         with patch.dict("os.environ", {
-            "VLLM_SPYRE_MAX_LOAD_PROCESSES": "0",
+            "VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS": "0",
         }), patch("vllm_spyre.envs._cache", {}):
             connector = InMemorySpyreConnector(
                 vllm_config=cfg, role=KVConnectorRole.WORKER,
@@ -336,7 +336,7 @@ class TestAsyncLayerPipeline:
         # --- Sync save ---
         sync_conn = _make_connector(
             block_size=4, store=store,
-            VLLM_SPYRE_MAX_LOAD_PROCESSES="0",
+            VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS="0",
         )
         staging_save = _make_staging_caches(num_layers=2, num_blocks=8)
         sync_conn.register_kv_caches(staging_save)
@@ -379,7 +379,7 @@ class TestAsyncLayerPipeline:
         # --- Async load ---
         async_conn = _make_connector(
             block_size=4, store=store,
-            VLLM_SPYRE_MAX_LOAD_PROCESSES="2",
+            VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS="2",
         )
         assert async_conn._async_load_enabled is True
         staging_async = _make_staging_caches(num_layers=2, num_blocks=8)
@@ -420,7 +420,7 @@ class TestAsyncLayerPipeline:
 
         conn = _make_connector(
             block_size=4, store=store,
-            VLLM_SPYRE_MAX_LOAD_PROCESSES="2",
+            VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS="2",
         )
         staging = _make_staging_caches(num_layers=2, num_blocks=8)
         conn.register_kv_caches(staging)
@@ -456,7 +456,7 @@ class TestAsyncLayerPipeline:
 
         conn = _make_connector(
             block_size=4, store=store,
-            VLLM_SPYRE_MAX_LOAD_PROCESSES="1",
+            VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS="1",
         )
         staging = _make_staging_caches(num_layers=1, num_blocks=8)
         conn.register_kv_caches(staging)
@@ -486,7 +486,7 @@ class TestAsyncLayerPipeline:
 
         conn = _make_connector(
             block_size=4, store=store,
-            VLLM_SPYRE_MAX_LOAD_PROCESSES="2",
+            VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS="2",
         )
         staging = _make_staging_caches(num_layers=2, num_blocks=8)
         conn.register_kv_caches(staging)
@@ -511,10 +511,10 @@ class TestAsyncLayerPipeline:
         conn.shutdown()
 
     def test_sync_fallback_when_workers_zero(self):
-        """With VLLM_SPYRE_MAX_LOAD_PROCESSES=0, sync path is used."""
+        """With VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS=0, sync path is used."""
         conn = _make_connector(
             block_size=4,
-            VLLM_SPYRE_MAX_LOAD_PROCESSES="0",
+            VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS="0",
         )
         assert conn._async_load_enabled is False
         assert conn._executor is None
@@ -529,7 +529,7 @@ class TestAsyncLayerPipeline:
 
         conn = _make_connector(
             block_size=4, store=store,
-            VLLM_SPYRE_MAX_LOAD_PROCESSES="2",
+            VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS="2",
         )
         staging = _make_staging_caches(num_layers=2, num_blocks=8)
         conn.register_kv_caches(staging)
@@ -573,7 +573,7 @@ class TestSchedulerFeedback:
 
         # Scheduler connector with fake saved request (no actual data)
         with patch.dict("os.environ", {
-            "VLLM_SPYRE_MAX_LOAD_PROCESSES": "0",
+            "VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS": "0",
         }), patch("vllm_spyre.envs._cache", {}):
             sched = InMemorySpyreConnector(
                 vllm_config=cfg, role=KVConnectorRole.SCHEDULER,
@@ -629,7 +629,7 @@ class TestSchedulerFeedback:
         cfg = _make_vllm_config_mock(block_size=4)
 
         with patch.dict("os.environ", {
-            "VLLM_SPYRE_MAX_LOAD_PROCESSES": "0",
+            "VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS": "0",
         }), patch("vllm_spyre.envs._cache", {}):
             sched = InMemorySpyreConnector(
                 vllm_config=cfg, role=KVConnectorRole.SCHEDULER,
@@ -731,7 +731,7 @@ class TestSchedulerFeedback:
         cfg = _make_vllm_config_mock(block_size=4)
 
         with patch.dict("os.environ", {
-            "VLLM_SPYRE_MAX_LOAD_PROCESSES": "0",
+            "VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS": "0",
         }), patch("vllm_spyre.envs._cache", {}):
             sched = InMemorySpyreConnector(
                 vllm_config=cfg, role=KVConnectorRole.SCHEDULER,
@@ -904,7 +904,7 @@ class TestConnectorShutdown:
         """shutdown() cleans up the thread pool executor."""
         conn = _make_connector(
             block_size=4,
-            VLLM_SPYRE_MAX_LOAD_PROCESSES="2",
+            VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS="2",
         )
         assert conn._executor is not None
         conn.shutdown()
@@ -914,7 +914,220 @@ class TestConnectorShutdown:
         """Calling shutdown() twice doesn't crash."""
         conn = _make_connector(
             block_size=4,
-            VLLM_SPYRE_MAX_LOAD_PROCESSES="2",
+            VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS="2",
         )
         conn.shutdown()
         conn.shutdown()  # Should not raise
+
+
+# ---------------------------------------------------------------------------
+# Byte-capped KV store
+# ---------------------------------------------------------------------------
+
+@pytest.mark.cpu
+class TestByteCapStore:
+    """Verify InMemoryKVStore byte-cap LRU eviction."""
+
+    def test_unlimited_when_cap_is_zero(self):
+        """max_bytes=0 means no byte-based eviction."""
+        store = InMemoryKVStore(max_bytes=0)
+        for i in range(100):
+            store.put(
+                StoreKey(f"r{i}", 0, 0, KVKind.K),
+                torch.randn(4, 1, 2),
+            )
+        assert store.size == 100
+        assert store.evictions == 0
+
+    def test_eviction_at_byte_cap(self):
+        """Entries evicted when byte cap is exceeded."""
+        # Each float32 tensor of shape (4,1,2) = 32 bytes
+        entry_bytes = 4 * 1 * 2 * 4  # 32 bytes
+        cap = entry_bytes * 3  # Room for 3 entries
+
+        store = InMemoryKVStore(max_bytes=cap)
+
+        for i in range(5):
+            store.put(
+                StoreKey(f"r{i}", 0, 0, KVKind.K),
+                torch.randn(4, 1, 2),
+            )
+
+        # Should have evicted 2 oldest to make room
+        assert store.size == 3
+        assert store.evictions == 2
+        assert store.current_bytes <= cap
+
+        # Oldest entries should be gone
+        assert store.get(StoreKey("r0", 0, 0, KVKind.K)) is None
+        assert store.get(StoreKey("r1", 0, 0, KVKind.K)) is None
+        # Newest should remain
+        assert store.get(StoreKey("r4", 0, 0, KVKind.K)) is not None
+
+    def test_overwrite_reclaims_bytes(self):
+        """Overwriting an entry doesn't double-count bytes."""
+        entry_bytes = 4 * 1 * 2 * 4  # 32 bytes
+        cap = entry_bytes * 2
+
+        store = InMemoryKVStore(max_bytes=cap)
+        key = StoreKey("r1", 0, 0, KVKind.K)
+
+        store.put(key, torch.randn(4, 1, 2))
+        assert store.current_bytes == entry_bytes
+
+        # Overwrite with same-size tensor
+        store.put(key, torch.randn(4, 1, 2))
+        assert store.current_bytes == entry_bytes
+        assert store.size == 1
+        assert store.evictions == 0
+
+    def test_remove_by_req_reclaims_bytes(self):
+        """remove_by_req subtracts bytes correctly."""
+        store = InMemoryKVStore()
+        store.put(StoreKey("r1", 0, 0, KVKind.K), torch.randn(4, 1, 2))
+        store.put(StoreKey("r1", 0, 0, KVKind.V), torch.randn(4, 1, 2))
+        assert store.current_bytes > 0
+
+        store.remove_by_req("r1")
+        assert store.current_bytes == 0
+        assert store.size == 0
+
+    def test_clear_resets_bytes(self):
+        """clear() resets byte tracking."""
+        store = InMemoryKVStore(max_bytes=1024)
+        store.put(StoreKey("r1", 0, 0, KVKind.K), torch.randn(4, 1, 2))
+        assert store.current_bytes > 0
+
+        store.clear()
+        assert store.current_bytes == 0
+        assert store.size == 0
+
+    def test_stats_include_byte_info(self):
+        """stats() reports max_bytes and evictions."""
+        store = InMemoryKVStore(max_bytes=1000)
+        store.put(StoreKey("r1", 0, 0, KVKind.K), torch.randn(4, 1, 2))
+
+        s = store.stats()
+        assert "max_bytes" in s
+        assert s["max_bytes"] == 1000
+        assert "evictions" in s
+        assert s["memory_estimate_bytes"] == store.current_bytes
+
+    def test_large_entry_evicts_many_small_ones(self):
+        """A single large entry can evict multiple small entries."""
+        small_bytes = 4 * 1 * 2 * 4  # 32 bytes
+        large_bytes = 4 * 4 * 4 * 4  # 1024 bytes
+        cap = small_bytes * 5 + large_bytes  # Room for 5 small + 1 large
+
+        store = InMemoryKVStore(max_bytes=cap)
+
+        # Add 6 small entries (6 * 32 = 192)
+        for i in range(6):
+            store.put(
+                StoreKey(f"r{i}", 0, 0, KVKind.K),
+                torch.randn(4, 1, 2),
+            )
+        assert store.size == 6
+
+        # Add 1 large entry — may need to evict small ones
+        store.put(
+            StoreKey("big", 0, 0, KVKind.K),
+            torch.randn(4, 4, 4),
+        )
+        assert store.current_bytes <= cap
+        assert store.get(StoreKey("big", 0, 0, KVKind.K)) is not None
+
+    def test_env_var_wires_to_global_store(self):
+        """VLLM_SPYRE_KV_STORE_MAX_BYTES configures the global store."""
+        from vllm_spyre.distributed.kv_transfer.kv_connector.v1 import (
+            inmemory_spyre_connector as mod,
+        )
+        old_store = mod._GLOBAL_STORE
+        try:
+            mod._GLOBAL_STORE = None
+            with patch.dict("os.environ", {
+                "VLLM_SPYRE_KV_STORE_MAX_BYTES": "4096",
+            }), patch("vllm_spyre.envs._cache", {}):
+                store = mod.get_global_store()
+            assert store.max_bytes == 4096
+        finally:
+            mod._GLOBAL_STORE = old_store
+
+
+# ---------------------------------------------------------------------------
+# Stricter metadata validation (layout, block-id bounds, mapping bounds)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.cpu
+class TestStricterValidation:
+    """Extended validation tests for layout, block-IDs, and mapping bounds."""
+
+    def test_unknown_layout_rejected(self):
+        """Unknown layout string is rejected."""
+        meta = SpyreConnectorMeta(layout="BSHD")
+        with pytest.raises(ValueError, match="Unknown layout"):
+            meta.validate()
+
+    def test_nhd_layout_accepted(self):
+        """NHD layout is accepted."""
+        meta = SpyreConnectorMeta(layout="NHD")
+        meta.validate()  # Should not raise
+
+    def test_empty_layout_accepted(self):
+        """Empty layout is accepted (optional field)."""
+        meta = SpyreConnectorMeta(layout="")
+        meta.validate()  # Should not raise
+
+    def test_negative_block_id_in_request(self):
+        """Negative block_id in request is rejected."""
+        meta = SpyreConnectorMeta(
+            requests=[SpyreConnectorRequestMeta(
+                req_id="r1", block_ids=[-1, 0],
+            )],
+        )
+        with pytest.raises(ValueError, match="negative block_id"):
+            meta.validate()
+
+    def test_negative_source_in_block_mapping(self):
+        """Negative source block in mapping is rejected."""
+        meta = SpyreConnectorMeta(
+            requests=[SpyreConnectorRequestMeta(
+                req_id="r1", is_store=False,
+                source_req_id="r0",
+                block_mapping=[(-1, 5)],
+            )],
+        )
+        with pytest.raises(ValueError, match="negative source block_id"):
+            meta.validate()
+
+    def test_negative_dest_in_block_mapping(self):
+        """Negative dest block in mapping is rejected."""
+        meta = SpyreConnectorMeta(
+            requests=[SpyreConnectorRequestMeta(
+                req_id="r1", is_store=False,
+                source_req_id="r0",
+                block_mapping=[(0, -1)],
+            )],
+        )
+        with pytest.raises(ValueError, match="negative dest block_id"):
+            meta.validate()
+
+    def test_valid_block_ids_pass(self):
+        """All non-negative block IDs pass validation."""
+        meta = SpyreConnectorMeta(
+            requests=[SpyreConnectorRequestMeta(
+                req_id="r1", block_ids=[0, 1, 2],
+            )],
+        )
+        meta.validate()  # Should not raise
+
+    def test_valid_block_mapping_passes(self):
+        """Non-negative source and dest in mapping passes."""
+        meta = SpyreConnectorMeta(
+            requests=[SpyreConnectorRequestMeta(
+                req_id="r1", is_store=False,
+                source_req_id="r0",
+                block_mapping=[(0, 5), (1, 6)],
+            )],
+        )
+        meta.validate()  # Should not raise
