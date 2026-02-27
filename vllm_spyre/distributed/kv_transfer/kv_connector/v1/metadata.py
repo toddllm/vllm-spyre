@@ -16,6 +16,7 @@ Key design decisions:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -209,6 +210,57 @@ class SpyreConnectorMeta(KVConnectorMetadata):
                 )
             seen.add(block_id)
 
+    # Supported schema versions for forward compatibility.
+    _SUPPORTED_VERSIONS: frozenset[int] = frozenset({1})
+
+    def validate(self) -> None:
+        """Strict validation of metadata fields.
+
+        Always checks schema_version and block mapping duplicates.
+        Checks dimensional fields (block_size, num_layers, etc.) only
+        when requests are present, since empty metadata may have defaults.
+
+        Raises:
+            ValueError: If any field is invalid or unsupported.
+        """
+        if self.schema_version not in self._SUPPORTED_VERSIONS:
+            raise ValueError(
+                f"Unsupported schema_version {self.schema_version}. "
+                f"Supported: {sorted(self._SUPPORTED_VERSIONS)}"
+            )
+
+        # Validate per-request metadata.
+        for req in self.requests:
+            if not req.req_id:
+                raise ValueError("Request with empty req_id in metadata")
+            if not req.is_store and not req.source_req_id and req.block_mapping:
+                raise ValueError(
+                    f"Load request {req.req_id} has block_mapping but "
+                    f"no source_req_id"
+                )
+
+        # Dimensional fields: reject only clearly invalid negative values.
+        # block_size=0 is allowed (informational; connector reads from config).
+        if self.num_layers < 0:
+            raise ValueError(
+                f"num_layers must be >= 0, got {self.num_layers}"
+            )
+        if self.num_kv_heads < 0:
+            raise ValueError(
+                f"num_kv_heads must be >= 0, got {self.num_kv_heads}"
+            )
+        if self.head_dim < 0:
+            raise ValueError(
+                f"head_dim must be >= 0, got {self.head_dim}"
+            )
+        if self.block_size < 0:
+            raise ValueError(
+                f"block_size must be >= 0, got {self.block_size}"
+            )
+
+        # Block mapping duplicate check (defers to existing method).
+        self.validate_block_mapping()
+
     @staticmethod
     def make_layer_names(num_layers: int) -> list[str]:
         """Generate vLLM-convention layer names."""
@@ -282,6 +334,63 @@ class InMemoryKVStore:
                 for e in self._store.values()
             ),
         }
+
+    def export_to_dir(self, path: str) -> int:
+        """Serialize all entries to a directory for cross-process transport.
+
+        Each entry is stored as a .pt file with the tensor and metadata.
+        Returns the number of entries exported.
+        """
+        os.makedirs(path, exist_ok=True)
+        count = 0
+        for key, entry in self._store.items():
+            fname = (
+                f"{key.req_id}__L{key.layer_idx}__B{key.block_id}"
+                f"__{key.kv_kind}.pt"
+            )
+            payload = {
+                "data": entry.data,
+                "dtype": entry.dtype,
+                "shape": entry.shape,
+                "version": entry.version,
+                "source_req": entry.source_req,
+                "key_req_id": key.req_id,
+                "key_layer_idx": key.layer_idx,
+                "key_block_id": key.block_id,
+                "key_kv_kind": str(key.kv_kind),
+            }
+            torch.save(payload, os.path.join(path, fname))
+            count += 1
+        return count
+
+    def import_from_dir(self, path: str) -> int:
+        """Deserialize entries from a directory into this store.
+
+        Returns the number of entries imported.
+        """
+        count = 0
+        for fname in os.listdir(path):
+            if not fname.endswith(".pt"):
+                continue
+            payload = torch.load(
+                os.path.join(path, fname), weights_only=False,
+            )
+            key = StoreKey(
+                req_id=payload["key_req_id"],
+                layer_idx=payload["key_layer_idx"],
+                block_id=payload["key_block_id"],
+                kv_kind=KVKind(payload["key_kv_kind"]),
+            )
+            self._version_counter += 1
+            self._store[key] = InMemoryKVEntry(
+                data=payload["data"],
+                dtype=payload["dtype"],
+                shape=payload["shape"],
+                version=self._version_counter,
+                source_req=payload["source_req"],
+            )
+            count += 1
+        return count
 
 
 # ---------------------------------------------------------------------------
