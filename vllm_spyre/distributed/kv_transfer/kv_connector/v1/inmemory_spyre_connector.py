@@ -32,11 +32,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorStats,
+)
+
 from vllm_spyre.distributed.kv_transfer.kv_connector.v1.metadata import (
     InMemoryKVStore,
     KVKind,
     SpyreConnectorMeta,
     SpyreConnectorRequestMeta,
+    SpyreConnectorStats,
     StoreKey,
 )
 
@@ -166,10 +171,20 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         self._step_loads: set[str] = set()
         self._load_error_block_ids: set[int] = set()
 
-        # Metrics
+        # Cumulative metrics (lifetime of connector)
         self._blocks_saved: int = 0
         self._blocks_loaded: int = 0
         self._blocks_missing: int = 0
+
+        # Per-interval stats (reset each time stats are collected)
+        self._stats = SpyreConnectorStats()
+
+        # Async-ready per-layer load tracking.
+        # Maps layer_name -> True when that layer's load is complete.
+        # Currently all loads are synchronous so all layers are marked
+        # done in start_load_kv, but this structure allows a future async
+        # backend to mark layers done individually.
+        self._layer_load_done: dict[str, bool] = {}
 
         logger.info(
             "[InMemorySpyreConnector] Initialized role=%s, block_size=%d",
@@ -238,9 +253,9 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
     ) -> None:
         """Load KV cache blocks from the store into staging tensors.
 
-        For each load-request in the metadata, for each layer, for each
-        block_id: look up the source data and copy into the staging
-        tensor at staging[0][block_id] (K) and staging[1][block_id] (V).
+        Iterates per-layer so that wait_for_layer_load() can eventually
+        gate on individual layer completion (async-ready). Currently all
+        loads are synchronous, so every layer is marked done immediately.
         """
         if not self.has_connector_metadata():
             return
@@ -249,9 +264,55 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         if not isinstance(meta, SpyreConnectorMeta):
             return
 
+        # Reset per-layer tracking for this step.
+        self._layer_load_done = {ln: False for ln in self._layer_names}
+
+        total_load = 0
+        total_miss = 0
+        self._load_error_block_ids.clear()
+
+        for layer_idx, layer_name in enumerate(self._layer_names):
+            layer_load, layer_miss = self._load_layer(
+                meta, layer_idx, layer_name,
+            )
+            total_load += layer_load
+            total_miss += layer_miss
+            # Mark layer done (sync backend — immediate).
+            self._layer_load_done[layer_name] = True
+
+        # Track request IDs that had load work.
+        for req_meta in meta.requests:
+            if not req_meta.is_store:
+                self._step_loads.add(req_meta.req_id)
+
+        self._blocks_loaded += total_load
+        self._blocks_missing += total_miss
+        self._stats.record("loaded_blocks", total_load)
+        self._stats.record("load_misses", total_miss)
+
+        if total_load > 0 or total_miss > 0:
+            logger.debug(
+                "[InMemorySpyreConnector] start_load_kv: loaded=%d, missed=%d",
+                total_load, total_miss,
+            )
+
+    def _load_layer(
+        self,
+        meta: SpyreConnectorMeta,
+        layer_idx: int,
+        layer_name: str,
+    ) -> tuple[int, int]:
+        """Load all blocks for one layer. Returns (loaded, missed) counts.
+
+        Factored out so a future async backend can issue per-layer loads
+        as independent operations.
+        """
+        staging = self._kv_caches.get(layer_name)
+        if staging is None:
+            return 0, 0
+
         load_count = 0
         miss_count = 0
-        self._load_error_block_ids.clear()
 
         for req_meta in meta.requests:
             if req_meta.is_store:
@@ -259,56 +320,38 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
 
             source_req = req_meta.source_req_id or req_meta.req_id
 
-            # Build block mapping: source_block_idx -> dest_block_id
             if req_meta.block_mapping:
                 mapping = dict(req_meta.block_mapping)
             else:
-                # Positional: source block at position i maps to
-                # dest block_ids[i]
                 mapping = {i: bid for i, bid in enumerate(req_meta.block_ids)}
 
-            for layer_idx, layer_name in enumerate(self._layer_names):
-                staging = self._kv_caches.get(layer_name)
-                if staging is None:
+            for src_idx, dest_bid in mapping.items():
+                if dest_bid < 0 or dest_bid >= staging.shape[1]:
+                    miss_count += 1
+                    self._load_error_block_ids.add(dest_bid)
                     continue
 
-                for src_idx, dest_bid in mapping.items():
-                    if dest_bid < 0 or dest_bid >= staging.shape[1]:
+                for kv_kind, kv_dim in [(KVKind.K, 0), (KVKind.V, 1)]:
+                    store_key = StoreKey(
+                        req_id=source_req,
+                        layer_idx=layer_idx,
+                        block_id=src_idx,
+                        kv_kind=kv_kind,
+                    )
+                    entry = self._store.get(store_key)
+                    if entry is None:
                         miss_count += 1
                         self._load_error_block_ids.add(dest_bid)
                         continue
 
-                    for kv_kind, kv_dim in [(KVKind.K, 0), (KVKind.V, 1)]:
-                        store_key = StoreKey(
-                            req_id=source_req,
-                            layer_idx=layer_idx,
-                            block_id=src_idx,
-                            kv_kind=kv_kind,
-                        )
-                        entry = self._store.get(store_key)
-                        if entry is None:
-                            miss_count += 1
-                            self._load_error_block_ids.add(dest_bid)
-                            continue
+                    try:
+                        staging[kv_dim][dest_bid].copy_(entry.data)
+                        load_count += 1
+                    except RuntimeError:
+                        miss_count += 1
+                        self._load_error_block_ids.add(dest_bid)
 
-                        # Copy into staging tensor at the dest block position
-                        try:
-                            staging[kv_dim][dest_bid].copy_(entry.data)
-                            load_count += 1
-                        except RuntimeError:
-                            miss_count += 1
-                            self._load_error_block_ids.add(dest_bid)
-
-            self._step_loads.add(req_meta.req_id)
-
-        self._blocks_loaded += load_count
-        self._blocks_missing += miss_count
-
-        if load_count > 0 or miss_count > 0:
-            logger.debug(
-                "[InMemorySpyreConnector] start_load_kv: loaded=%d, missed=%d",
-                load_count, miss_count,
-            )
+        return load_count, miss_count
 
     # ------------------------------------------------------------------
     # Worker-side: KV save
@@ -366,6 +409,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             self._step_stores.add(req_meta.req_id)
 
         self._blocks_saved += save_count
+        self._stats.record("saved_blocks", save_count)
 
         if save_count > 0:
             logger.debug(
@@ -379,8 +423,15 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
     # ------------------------------------------------------------------
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """No-op: all loading is done synchronously in start_load_kv."""
-        pass
+        """Wait for a specific layer's load to complete.
+
+        With the current synchronous backend this is always a no-op
+        (the layer is already marked done in start_load_kv). A future
+        async backend would block here until the layer's DMA completes.
+        """
+        if not self._layer_load_done.get(layer_name, True):
+            # Future: poll/wait for async completion.
+            pass
 
     def wait_for_save(self) -> None:
         """Trigger bulk save. In upstream protocol, this blocks until
@@ -435,6 +486,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         prompt = request.prompt_token_ids
         if not prompt or not self._saved_requests:
             self._pending_load_sources.pop(request.request_id, None)
+            self._stats.record("match_attempts")
             return 0, False
 
         prompt_tuple = tuple(prompt)
@@ -479,6 +531,8 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                 matched_tokens_total=best_tokens_total,
                 num_local_computed_tokens=num_local,
             )
+            self._stats.record("match_attempts")
+            self._stats.record("matched_tokens", num_external)
             logger.debug(
                 "[InMemorySpyreConnector] get_num_new_matched_tokens: "
                 "req=%s matched source=%s, total=%d, local=%d, external=%d",
@@ -491,6 +545,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             return num_external, False
 
         self._pending_load_sources.pop(request.request_id, None)
+        self._stats.record("match_attempts")
         return 0, False
 
     # ------------------------------------------------------------------
@@ -645,6 +700,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             if self._saved_requests_max_size > 0:
                 while len(self._saved_requests) > self._saved_requests_max_size:
                     evicted_id, _ = self._saved_requests.popitem(last=False)
+                    self._stats.record("evictions")
                     logger.debug(
                         "[InMemorySpyreConnector] Evicted saved request %s "
                         "(registry at cap %d)",
@@ -664,6 +720,41 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                 request.request_id, len(block_ids),
             )
         return False, None
+
+    # ------------------------------------------------------------------
+    # Stats and metrics
+    # ------------------------------------------------------------------
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        """Return accumulated stats for the current interval.
+
+        The bridge calls this in after_forward() and attaches the result
+        to KVConnectorOutput. This method resets the internal interval
+        counters after returning a snapshot.
+        """
+        if self._stats.is_empty():
+            return None
+        snapshot = SpyreConnectorStats(data=dict(self._stats.data))
+        self._stats.reset()
+        return snapshot
+
+    @classmethod
+    def build_kv_connector_stats(
+        cls, data: dict[str, Any] | None = None
+    ) -> KVConnectorStats | None:
+        """Factory for deserialization on the logger side."""
+        if data is not None:
+            return SpyreConnectorStats(data=data)
+        return SpyreConnectorStats()
+
+    def get_cumulative_metrics(self) -> dict[str, int]:
+        """Return lifetime cumulative metrics (for testing/inspection)."""
+        return {
+            "blocks_saved": self._blocks_saved,
+            "blocks_loaded": self._blocks_loaded,
+            "blocks_missing": self._blocks_missing,
+            "saved_requests_count": len(self._saved_requests),
+        }
 
     # ------------------------------------------------------------------
     # Utilities
