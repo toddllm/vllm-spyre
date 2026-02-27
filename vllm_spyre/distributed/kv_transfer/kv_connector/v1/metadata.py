@@ -17,7 +17,7 @@ Key design decisions:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 import torch
@@ -25,13 +25,16 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorStats,
+)
 
 
 # ---------------------------------------------------------------------------
 # Store Key (for in-memory key-value store)
 # ---------------------------------------------------------------------------
 
-class KVKind(str, Enum):
+class KVKind(StrEnum):
     """Discriminator for key vs value tensors.
 
     FMS stores K and V as separate tensors per layer. For Spyre-internal
@@ -279,3 +282,49 @@ class InMemoryKVStore:
                 for e in self._store.values()
             ),
         }
+
+
+# ---------------------------------------------------------------------------
+# Connector Stats (upstream KVConnectorStats subclass)
+# ---------------------------------------------------------------------------
+
+_STATS_KEYS = (
+    "matched_tokens",
+    "loaded_blocks",
+    "saved_blocks",
+    "load_misses",
+    "evictions",
+    "match_attempts",
+)
+
+
+@dataclass
+class SpyreConnectorStats(KVConnectorStats):
+    """Per-interval telemetry for the InMemorySpyreConnector.
+
+    Each counter accumulates observations during a logging interval.
+    reset() zeroes the counters for the next interval.
+    """
+
+    def __post_init__(self):
+        if not self.data:
+            self.reset()
+
+    def reset(self):
+        self.data = {k: 0 for k in _STATS_KEYS}
+
+    def record(self, key: str, value: int = 1) -> None:
+        self.data[key] = self.data.get(key, 0) + value
+
+    def aggregate(
+        self, other: KVConnectorStats
+    ) -> SpyreConnectorStats:
+        for k in _STATS_KEYS:
+            self.data[k] = self.data.get(k, 0) + other.data.get(k, 0)
+        return self
+
+    def reduce(self) -> dict[str, int | float]:
+        return {k: self.data.get(k, 0) for k in _STATS_KEYS}
+
+    def is_empty(self) -> bool:
+        return all(self.data.get(k, 0) == 0 for k in _STATS_KEYS)
