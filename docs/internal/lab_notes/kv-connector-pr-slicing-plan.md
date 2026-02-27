@@ -1,8 +1,8 @@
 # KV Connector PR Slicing Plan
 
 ## Goal
-Keep `codex/spyre-kv-connector` as an integration branch, while making it easy
-to open focused PRs without dragging unrelated scope.
+Keep `codex/spyre-kv-connector` as an integration/planning branch, while making
+it easy to open focused PRs without dragging unrelated scope.
 
 ## Current stack (on top of `origin/pr-759`)
 1. `51d14f0` bridge lifecycle wiring
@@ -17,13 +17,21 @@ to open focused PRs without dragging unrelated scope.
 10. `2d509e8` byte-capped store + dedicated async env var
 11. `4c9bb8a` Prometheus metrics adapter
 
+## Prepared branches on fork
+
+- Base mirror: `codex/spyre-kv-base-pr759`
+- Slice 1: `codex/spyre-kv-slice1-bridge`
+- Slice 2: `codex/spyre-kv-slice2-core`
+- Slice 3: `codex/spyre-kv-slice3-runtime`
+- Slice 4: `codex/spyre-kv-slice4-metrics`
+- Combined testing branch: `codex/spyre-kv-combined`
+- Planning/integration branch: `codex/spyre-kv-connector`
+
 ## Suggested PR lanes
 
 ### PR 1: Bridge-only wiring (smallest mergeable unit)
-Commits:
-- `51d14f0`
-- `b2f7fa1`
-- `4b3ce55`
+Branch:
+- `codex/spyre-kv-slice1-bridge`
 
 Includes:
 - `vllm_spyre/v1/worker/spyre_kv_connector_bridge.py`
@@ -31,10 +39,8 @@ Includes:
 - bridge tests only
 
 ### PR 2: Connector core + metadata contract
-Commits:
-- `7143301`
-- `11da8df`
-- `d09dc6f`
+Branch:
+- `codex/spyre-kv-slice2-core`
 
 Includes:
 - connector implementation
@@ -42,11 +48,8 @@ Includes:
 - scheduler-driven reuse semantics
 
 ### PR 3: Runtime hardening + integration tests
-Commits:
-- `fe1cece`
-- `a7f3801`
-- `2fe2d95`
-- `2d509e8`
+Branch:
+- `codex/spyre-kv-slice3-runtime`
 
 Includes:
 - failure semantics and registry caps
@@ -55,23 +58,19 @@ Includes:
 - byte-capped store controls
 
 ### PR 4: Metrics and observability
-Commits:
-- `4c9bb8a`
+Branch:
+- `codex/spyre-kv-slice4-metrics`
 
 Includes:
 - Prometheus adapter wiring
 - metrics-focused tests
 
-## Execution pattern for focused PR branches
-Use a fresh branch from `origin/pr-759`, then cherry-pick only the needed
-commits for that PR lane:
-
-```bash
-git checkout -b codex/spyre-kv-pr1-bridge origin/pr-759
-git cherry-pick 51d14f0 b2f7fa1 4b3ce55
-```
-
-Repeat for PR2/PR3/PR4 with their respective commit sets.
+## Execution pattern for focused PRs
+Use the prepared slice branches directly as PR heads and set PR base to:
+- Slice1 base: `codex/spyre-kv-base-pr759`
+- Slice2 base: `codex/spyre-kv-slice1-bridge`
+- Slice3 base: `codex/spyre-kv-slice2-core`
+- Slice4 base: `codex/spyre-kv-slice3-runtime`
 
 ## Hygiene rules
 - Keep `docs/internal/` out of upstream PRs unless specifically requested.
