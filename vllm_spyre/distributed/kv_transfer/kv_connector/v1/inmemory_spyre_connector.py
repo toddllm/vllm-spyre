@@ -17,10 +17,13 @@ register_kv_caches(). The model runner owns FMS<->staging sync.
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+
+import vllm_spyre.envs as envs_spyre
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -137,8 +140,11 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         self._pending_requests: list[SpyreConnectorRequestMeta] = []
 
         # Scheduler-side saved-request registry for prefix reuse.
-        # Maps req_id -> _SavedRequest for requests whose KV was saved.
-        self._saved_requests: dict[str, _SavedRequest] = {}
+        # OrderedDict for LRU eviction — oldest entries evicted first.
+        self._saved_requests: OrderedDict[str, _SavedRequest] = OrderedDict()
+        self._saved_requests_max_size: int = (
+            envs_spyre.VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE
+        )
 
         # Per-step: maps request_id -> match context for load requests
         # that were matched in get_num_new_matched_tokens this step.
@@ -630,11 +636,26 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                 block_ids=list(block_ids),
                 num_tokens=len(prompt),
             )
+            # If already present, move to end (most-recently-used).
+            if request.request_id in self._saved_requests:
+                self._saved_requests.move_to_end(request.request_id)
             self._saved_requests[request.request_id] = saved
+
+            # Evict oldest entries if over the cap (0 = unlimited).
+            if self._saved_requests_max_size > 0:
+                while len(self._saved_requests) > self._saved_requests_max_size:
+                    evicted_id, _ = self._saved_requests.popitem(last=False)
+                    logger.debug(
+                        "[InMemorySpyreConnector] Evicted saved request %s "
+                        "(registry at cap %d)",
+                        evicted_id, self._saved_requests_max_size,
+                    )
+
             logger.debug(
                 "[InMemorySpyreConnector] request_finished: req=%s saved "
-                "(%d tokens, %d blocks) for reuse",
+                "(%d tokens, %d blocks) for reuse, registry_size=%d",
                 request.request_id, len(prompt), len(block_ids),
+                len(self._saved_requests),
             )
         else:
             logger.debug(
