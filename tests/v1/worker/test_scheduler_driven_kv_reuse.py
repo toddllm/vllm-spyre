@@ -577,6 +577,27 @@ class TestUpdateStateAfterAlloc:
         assert len(meta.requests) == 1
         assert meta.requests[0].is_store is True  # Fell back to store
 
+    def test_fallback_to_store_when_mapping_is_incomplete(self):
+        """If external token count cannot be fully mapped, fall back to store."""
+        sched = _make_connector(block_size=4)
+
+        # Deliberately inconsistent saved entry:
+        # prompt length implies 2 external blocks, but only 1 source block id.
+        req_a = _make_request("req-A", [1, 2, 3, 4, 5, 6, 7, 8])
+        sched.request_finished(req_a, [10])
+
+        req_b = _make_request("req-B", [1, 2, 3, 4, 5, 6, 7, 8])
+        matched, _ = sched.get_num_new_matched_tokens(req_b, 0)
+        assert matched == 8
+
+        blocks_b = _make_blocks([20, 21])
+        sched.update_state_after_alloc(req_b, blocks_b, num_external_tokens=8)
+
+        so = _make_scheduler_output()
+        meta = sched.build_connector_meta(so)
+        assert len(meta.requests) == 1
+        assert meta.requests[0].is_store is True
+
 
 # ---------------------------------------------------------------------------
 # Best-match selection

@@ -253,20 +253,22 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
 
             source_req = req_meta.source_req_id or req_meta.req_id
 
-            # Build block mapping: source_block_idx -> dest_block_id
+            # Build block mapping: source_block_id -> dest_block_id
             if req_meta.block_mapping:
-                mapping = dict(req_meta.block_mapping)
+                mapping = list(req_meta.block_mapping)
             else:
-                # Positional: source block at position i maps to
-                # dest block_ids[i]
-                mapping = {i: bid for i, bid in enumerate(req_meta.block_ids)}
+                # Identity mapping fallback: source and destination block IDs
+                # are the same when no explicit remap is provided.
+                mapping = [
+                    (block_id, block_id) for block_id in req_meta.block_ids
+                ]
 
             for layer_idx, layer_name in enumerate(self._layer_names):
                 staging = self._kv_caches.get(layer_name)
                 if staging is None:
                     continue
 
-                for src_idx, dest_bid in mapping.items():
+                for src_block_id, dest_bid in mapping:
                     if dest_bid < 0 or dest_bid >= staging.shape[1]:
                         miss_count += 1
                         self._load_error_block_ids.add(dest_bid)
@@ -276,7 +278,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                         store_key = StoreKey(
                             req_id=source_req,
                             layer_idx=layer_idx,
-                            block_id=src_idx,
+                            block_id=src_block_id,
                             kv_kind=kv_kind,
                         )
                         entry = self._store.get(store_key)
@@ -558,14 +560,29 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                     dest_block_id = flat_block_ids[dest_idx]
                     block_mapping.append((src_block_id, dest_block_id))
 
-                req_meta = SpyreConnectorRequestMeta(
-                    req_id=request.request_id,
-                    block_ids=flat_block_ids,
-                    is_store=False,
-                    token_count=num_external_tokens,
-                    source_req_id=source.req_id,
-                    block_mapping=block_mapping,
-                )
+                if len(block_mapping) != num_external_blocks:
+                    logger.warning(
+                        "[InMemorySpyreConnector] update_state_after_alloc: "
+                        "incomplete block mapping for req=%s "
+                        "(expected %d, built %d). Falling back to store.",
+                        request.request_id, num_external_blocks,
+                        len(block_mapping),
+                    )
+                    req_meta = SpyreConnectorRequestMeta(
+                        req_id=request.request_id,
+                        block_ids=flat_block_ids,
+                        is_store=True,
+                        token_count=len(request.all_token_ids),
+                    )
+                else:
+                    req_meta = SpyreConnectorRequestMeta(
+                        req_id=request.request_id,
+                        block_ids=flat_block_ids,
+                        is_store=False,
+                        token_count=num_external_tokens,
+                        source_req_id=source.req_id,
+                        block_mapping=block_mapping,
+                    )
         else:
             # Store path: normal prefill
             req_meta = SpyreConnectorRequestMeta(
