@@ -213,12 +213,19 @@ class SpyreConnectorMeta(KVConnectorMetadata):
     # Supported schema versions for forward compatibility.
     _SUPPORTED_VERSIONS: frozenset[int] = frozenset({1})
 
+    # Known layout values.
+    _KNOWN_LAYOUTS: frozenset[str] = frozenset({"NHD"})
+
     def validate(self) -> None:
         """Strict validation of metadata fields.
 
-        Always checks schema_version and block mapping duplicates.
-        Checks dimensional fields (block_size, num_layers, etc.) only
-        when requests are present, since empty metadata may have defaults.
+        Checks:
+          - schema_version is supported
+          - layout is a known value
+          - dimensional fields are non-negative
+          - per-request: req_id non-empty, block_ids non-negative,
+            block_mapping bounds, load-needs-source consistency
+          - block mapping duplicate check
 
         Raises:
             ValueError: If any field is invalid or unsupported.
@@ -227,6 +234,12 @@ class SpyreConnectorMeta(KVConnectorMetadata):
             raise ValueError(
                 f"Unsupported schema_version {self.schema_version}. "
                 f"Supported: {sorted(self._SUPPORTED_VERSIONS)}"
+            )
+
+        if self.layout and self.layout not in self._KNOWN_LAYOUTS:
+            raise ValueError(
+                f"Unknown layout '{self.layout}'. "
+                f"Known: {sorted(self._KNOWN_LAYOUTS)}"
             )
 
         # Validate per-request metadata.
@@ -238,6 +251,24 @@ class SpyreConnectorMeta(KVConnectorMetadata):
                     f"Load request {req.req_id} has block_mapping but "
                     f"no source_req_id"
                 )
+            # Block ID sanity: all block_ids must be non-negative.
+            for bid in req.block_ids:
+                if bid < 0:
+                    raise ValueError(
+                        f"Request {req.req_id} has negative block_id {bid}"
+                    )
+            # Block mapping bounds: all source and dest must be non-negative.
+            for src, dest in req.block_mapping:
+                if src < 0:
+                    raise ValueError(
+                        f"Request {req.req_id} block_mapping has "
+                        f"negative source block_id {src}"
+                    )
+                if dest < 0:
+                    raise ValueError(
+                        f"Request {req.req_id} block_mapping has "
+                        f"negative dest block_id {dest}"
+                    )
 
         # Dimensional fields: reject only clearly invalid negative values.
         # block_size=0 is allowed (informational; connector reads from config).
@@ -272,19 +303,42 @@ class SpyreConnectorMeta(KVConnectorMetadata):
 # ---------------------------------------------------------------------------
 
 class InMemoryKVStore:
-    """Dictionary-backed KV store with metrics tracking.
+    """Dictionary-backed KV store with optional byte-cap LRU eviction.
+
+    When ``max_bytes`` > 0, entries are evicted in insertion order (oldest
+    first) when total memory usage would exceed the cap. Insertion order
+    is maintained via a Python ``dict`` (guaranteed ordered since 3.7).
 
     Injectable: tests can create a fresh store and pass it to the connector.
     NOT thread-safe (Spyre uses single-worker model).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_bytes: int = 0) -> None:
         self._store: dict[StoreKey, InMemoryKVEntry] = {}
         self._version_counter: int = 0
+        self._max_bytes: int = max(0, max_bytes)
+        self._current_bytes: int = 0
+        self._evictions: int = 0
 
     @property
     def size(self) -> int:
         return len(self._store)
+
+    @property
+    def current_bytes(self) -> int:
+        return self._current_bytes
+
+    @property
+    def max_bytes(self) -> int:
+        return self._max_bytes
+
+    @property
+    def evictions(self) -> int:
+        return self._evictions
+
+    @staticmethod
+    def _entry_bytes(entry: InMemoryKVEntry) -> int:
+        return entry.data.nelement() * entry.data.element_size()
 
     def put(
         self,
@@ -297,14 +351,41 @@ class InMemoryKVStore:
         version = self._version_counter
         was_overwrite = key in self._store
 
-        self._store[key] = InMemoryKVEntry(
+        # If overwriting, subtract the old entry's size first.
+        if was_overwrite:
+            old = self._store[key]
+            self._current_bytes -= self._entry_bytes(old)
+
+        entry = InMemoryKVEntry(
             data=data.detach().clone().cpu(),
             dtype=str(data.dtype),
             shape=tuple(data.shape),
             version=version,
             source_req=source_req,
         )
+        entry_size = self._entry_bytes(entry)
+
+        # Evict oldest entries if adding this would exceed the byte cap.
+        if self._max_bytes > 0:
+            while (
+                self._store
+                and self._current_bytes + entry_size > self._max_bytes
+            ):
+                self._evict_oldest()
+
+        self._store[key] = entry
+        self._current_bytes += entry_size
         return version, was_overwrite
+
+    def _evict_oldest(self) -> StoreKey | None:
+        """Remove the oldest entry (first in insertion order)."""
+        if not self._store:
+            return None
+        oldest_key = next(iter(self._store))
+        oldest_entry = self._store.pop(oldest_key)
+        self._current_bytes -= self._entry_bytes(oldest_entry)
+        self._evictions += 1
+        return oldest_key
 
     def get(self, key: StoreKey) -> InMemoryKVEntry | None:
         return self._store.get(key)
@@ -316,12 +397,14 @@ class InMemoryKVStore:
         """Remove all entries for a request ID. Returns count removed."""
         keys = [k for k in self._store if k.req_id == req_id]
         for k in keys:
-            del self._store[k]
+            entry = self._store.pop(k)
+            self._current_bytes -= self._entry_bytes(entry)
         return len(keys)
 
     def clear(self) -> None:
         self._store.clear()
         self._version_counter = 0
+        self._current_bytes = 0
 
     def stats(self) -> dict[str, Any]:
         req_ids = {k.req_id for k in self._store}
@@ -329,10 +412,9 @@ class InMemoryKVStore:
             "total_entries": len(self._store),
             "unique_requests": len(req_ids),
             "version_counter": self._version_counter,
-            "memory_estimate_bytes": sum(
-                e.data.nelement() * e.data.element_size()
-                for e in self._store.values()
-            ),
+            "memory_estimate_bytes": self._current_bytes,
+            "max_bytes": self._max_bytes,
+            "evictions": self._evictions,
         }
 
     def export_to_dir(self, path: str) -> int:

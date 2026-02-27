@@ -67,7 +67,8 @@ _GLOBAL_STORE: InMemoryKVStore | None = None
 def get_global_store() -> InMemoryKVStore:
     global _GLOBAL_STORE
     if _GLOBAL_STORE is None:
-        _GLOBAL_STORE = InMemoryKVStore()
+        max_bytes = envs_spyre.VLLM_SPYRE_KV_STORE_MAX_BYTES
+        _GLOBAL_STORE = InMemoryKVStore(max_bytes=max_bytes)
     return _GLOBAL_STORE
 
 
@@ -76,7 +77,8 @@ def reset_global_store() -> None:
     if _GLOBAL_STORE is not None:
         _GLOBAL_STORE.clear()
     else:
-        _GLOBAL_STORE = InMemoryKVStore()
+        max_bytes = envs_spyre.VLLM_SPYRE_KV_STORE_MAX_BYTES
+        _GLOBAL_STORE = InMemoryKVStore(max_bytes=max_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +187,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         # to a thread pool and wait_for_layer_load() blocks on futures.
         # When False (default), loads are synchronous as before.
         self._async_load_workers: int = max(
-            0, envs_spyre.VLLM_SPYRE_MAX_LOAD_PROCESSES
+            0, envs_spyre.VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS
         )
         self._async_load_enabled: bool = self._async_load_workers > 0
         self._executor: ThreadPoolExecutor | None = (
