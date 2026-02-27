@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -179,16 +180,27 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         # Per-interval stats (reset each time stats are collected)
         self._stats = SpyreConnectorStats()
 
-        # Async-ready per-layer load tracking.
-        # Maps layer_name -> True when that layer's load is complete.
-        # Currently all loads are synchronous so all layers are marked
-        # done in start_load_kv, but this structure allows a future async
-        # backend to mark layers done individually.
+        # Async layer pipeline.
+        # When _async_load_enabled is True, per-layer loads are submitted
+        # to a thread pool and wait_for_layer_load() blocks on futures.
+        # When False (default), loads are synchronous as before.
+        self._async_load_workers: int = max(
+            0, envs_spyre.VLLM_SPYRE_MAX_LOAD_PROCESSES
+        )
+        self._async_load_enabled: bool = self._async_load_workers > 0
+        self._executor: ThreadPoolExecutor | None = (
+            ThreadPoolExecutor(max_workers=self._async_load_workers)
+            if self._async_load_enabled
+            else None
+        )
+        self._layer_load_futures: dict[str, Future[tuple[int, int]]] = {}
         self._layer_load_done: dict[str, bool] = {}
 
         logger.info(
-            "[InMemorySpyreConnector] Initialized role=%s, block_size=%d",
+            "[InMemorySpyreConnector] Initialized role=%s, block_size=%d, "
+            "async_load=%s (workers=%d)",
             self._role_name, self._block_size,
+            self._async_load_enabled, self._async_load_workers,
         )
 
     # ------------------------------------------------------------------
@@ -231,7 +243,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         self, connector_metadata: KVConnectorMetadata
     ) -> None:
         if isinstance(connector_metadata, SpyreConnectorMeta):
-            connector_metadata.validate_block_mapping()
+            connector_metadata.validate()
         else:
             logger.warning(
                 "[InMemorySpyreConnector] Expected SpyreConnectorMeta, "
@@ -253,9 +265,12 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
     ) -> None:
         """Load KV cache blocks from the store into staging tensors.
 
-        Iterates per-layer so that wait_for_layer_load() can eventually
-        gate on individual layer completion (async-ready). Currently all
-        loads are synchronous, so every layer is marked done immediately.
+        When async loading is enabled (VLLM_SPYRE_MAX_LOAD_PROCESSES > 0),
+        per-layer loads are submitted to a thread pool and
+        wait_for_layer_load() blocks on the individual layer's future.
+
+        When async loading is disabled (default), loads are synchronous
+        and every layer is marked done immediately.
         """
         if not self.has_connector_metadata():
             return
@@ -266,35 +281,44 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
 
         # Reset per-layer tracking for this step.
         self._layer_load_done = {ln: False for ln in self._layer_names}
-
-        total_load = 0
-        total_miss = 0
+        self._layer_load_futures.clear()
         self._load_error_block_ids.clear()
 
-        for layer_idx, layer_name in enumerate(self._layer_names):
-            layer_load, layer_miss = self._load_layer(
-                meta, layer_idx, layer_name,
-            )
-            total_load += layer_load
-            total_miss += layer_miss
-            # Mark layer done (sync backend — immediate).
-            self._layer_load_done[layer_name] = True
+        if self._async_load_enabled and self._executor is not None:
+            # Async path: submit per-layer loads to thread pool.
+            for layer_idx, layer_name in enumerate(self._layer_names):
+                future = self._executor.submit(
+                    self._load_layer, meta, layer_idx, layer_name,
+                )
+                self._layer_load_futures[layer_name] = future
+        else:
+            # Sync path: load all layers sequentially.
+            total_load = 0
+            total_miss = 0
+
+            for layer_idx, layer_name in enumerate(self._layer_names):
+                layer_load, layer_miss = self._load_layer(
+                    meta, layer_idx, layer_name,
+                )
+                total_load += layer_load
+                total_miss += layer_miss
+                self._layer_load_done[layer_name] = True
+
+            self._blocks_loaded += total_load
+            self._blocks_missing += total_miss
+            self._stats.record("loaded_blocks", total_load)
+            self._stats.record("load_misses", total_miss)
+
+            if total_load > 0 or total_miss > 0:
+                logger.debug(
+                    "[InMemorySpyreConnector] start_load_kv: loaded=%d, missed=%d",
+                    total_load, total_miss,
+                )
 
         # Track request IDs that had load work.
         for req_meta in meta.requests:
             if not req_meta.is_store:
                 self._step_loads.add(req_meta.req_id)
-
-        self._blocks_loaded += total_load
-        self._blocks_missing += total_miss
-        self._stats.record("loaded_blocks", total_load)
-        self._stats.record("load_misses", total_miss)
-
-        if total_load > 0 or total_miss > 0:
-            logger.debug(
-                "[InMemorySpyreConnector] start_load_kv: loaded=%d, missed=%d",
-                total_load, total_miss,
-            )
 
     def _load_layer(
         self,
@@ -425,13 +449,31 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Wait for a specific layer's load to complete.
 
-        With the current synchronous backend this is always a no-op
-        (the layer is already marked done in start_load_kv). A future
-        async backend would block here until the layer's DMA completes.
+        With async loading enabled, blocks until the layer's thread pool
+        future resolves. With sync loading, this is a no-op (the layer
+        is already marked done in start_load_kv).
         """
-        if not self._layer_load_done.get(layer_name, True):
-            # Future: poll/wait for async completion.
-            pass
+        if self._layer_load_done.get(layer_name, True):
+            return
+
+        future = self._layer_load_futures.get(layer_name)
+        if future is not None:
+            layer_load, layer_miss = future.result()
+            self._layer_load_done[layer_name] = True
+            self._blocks_loaded += layer_load
+            self._blocks_missing += layer_miss
+            self._stats.record("loaded_blocks", layer_load)
+            self._stats.record("load_misses", layer_miss)
+            del self._layer_load_futures[layer_name]
+
+    def _collect_all_async_loads(self) -> None:
+        """Block until all outstanding async layer loads complete.
+
+        Called internally before operations that need all loads done
+        (e.g., get_finished, get_block_ids_with_load_errors).
+        """
+        for layer_name in list(self._layer_load_futures):
+            self.wait_for_layer_load(layer_name)
 
     def wait_for_save(self) -> None:
         """Trigger bulk save. In upstream protocol, this blocks until
@@ -447,6 +489,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         Only marks request IDs finished when actual work was completed
         this step. Does NOT over-report.
         """
+        self._collect_all_async_loads()
         finished_sending = self._step_stores & finished_req_ids
         finished_recving = self._step_loads & finished_req_ids
 
@@ -457,6 +500,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Return destination block IDs that failed to load this step."""
+        self._collect_all_async_loads()
         return set(self._load_error_block_ids)
 
     # ------------------------------------------------------------------
@@ -766,6 +810,9 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
 
     def shutdown(self) -> None:
         """Clean up on worker shutdown."""
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
         logger.info(
             "[InMemorySpyreConnector] Shutdown. Store stats: %s",
             self._store.stats(),
