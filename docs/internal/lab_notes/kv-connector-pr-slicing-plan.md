@@ -27,6 +27,25 @@ it easy to open focused PRs without dragging unrelated scope.
 - Combined testing branch: `codex/spyre-kv-combined`
 - Planning/integration branch: `codex/spyre-kv-connector`
 
+## Why the stack is split this way
+
+The split is not arbitrary. It mirrors the actual risk boundaries:
+
+1. Bridge wiring:
+- changes control flow first
+- should be reviewable without debating metadata or reuse policy
+
+2. Connector core:
+- introduces the contract and correctness semantics
+- should be reviewable without runtime hardening noise
+
+3. Runtime hardening:
+- increases operational complexity
+- should land only after the contract is accepted
+
+4. Metrics:
+- should remain optional and easy to separate from semantic changes
+
 ## Suggested PR lanes
 
 ### PR 1: Bridge-only wiring (smallest mergeable unit)
@@ -38,6 +57,10 @@ Includes:
 - minimal runner/worker wiring
 - bridge tests only
 
+Risk profile:
+- medium
+- control-flow-sensitive but conceptually narrow
+
 ### PR 2: Connector core + metadata contract
 Branch:
 - `codex/spyre-kv-slice2-core`
@@ -46,6 +69,10 @@ Includes:
 - connector implementation
 - metadata types + validation baseline
 - scheduler-driven reuse semantics
+
+Risk profile:
+- high
+- this is the contract-defining slice
 
 ### PR 3: Runtime hardening + integration tests
 Branch:
@@ -57,6 +84,10 @@ Includes:
 - 2-process E2E test path
 - byte-capped store controls
 
+Risk profile:
+- high
+- runtime complexity and broader tests
+
 ### PR 4: Metrics and observability
 Branch:
 - `codex/spyre-kv-slice4-metrics`
@@ -64,6 +95,10 @@ Branch:
 Includes:
 - Prometheus adapter wiring
 - metrics-focused tests
+
+Risk profile:
+- low to medium
+- mostly additive, but can confuse review if mixed into core logic
 
 ## Execution pattern for focused PRs
 Use the prepared slice branches directly as PR heads and set PR base to:
@@ -76,3 +111,20 @@ Use the prepared slice branches directly as PR heads and set PR base to:
 - Keep `docs/internal/` out of upstream PRs unless specifically requested.
 - Avoid host-specific names in committed notes.
 - Keep each PR lane independently testable (`pytest` subset listed in PR body).
+
+## When to stop and not widen scope
+
+Stop at Slice 1 if:
+- we only need to prove lifecycle wiring
+- reviewers are not aligned yet on connector ownership
+
+Stop at Slice 2 if:
+- we need a correctness-first connector POC
+- we want something defensible before runtime complexity grows
+
+Only move to Slice 3 if:
+- Slice 2 semantics are accepted
+- we specifically need runtime hardening and broader validation
+
+Treat Slice 4 as optional if:
+- observability is useful but not part of the immediate decision

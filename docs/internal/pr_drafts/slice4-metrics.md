@@ -22,6 +22,20 @@ Out of scope:
 - connector runtime semantics changes
 - scheduler/model-runner behavior changes
 
+## What this slice is trying to prove
+
+This slice is intentionally narrow.
+
+It is meant to prove:
+
+1. We can surface connector behavior through the upstream metrics seam without
+   destabilizing connector semantics.
+2. The stats contract introduced earlier is sufficient to drive counters.
+3. Observability can remain an overlay rather than getting entangled with core
+   connector logic.
+
+This slice should be easy to review precisely because it is small.
+
 ## Included commit
 
 - `3448cf9` Add Prometheus metrics adapter for Spyre KV connector (P2)
@@ -30,6 +44,55 @@ Out of scope:
 
 - `vllm_spyre/distributed/kv_transfer/kv_connector/v1/inmemory_spyre_connector.py`
 - `tests/v1/worker/test_kv_phase6.py`
+
+Diffstat summary:
+- 2 files changed
+- 408 insertions
+- 3 deletions
+
+## File-by-file intent
+
+`vllm_spyre/distributed/.../v1/inmemory_spyre_connector.py`
+- adds Prometheus adapter object
+- maps connector stats into named counters
+- keeps existing connector runtime semantics intact
+
+`tests/v1/worker/test_kv_phase6.py`
+- adds adapter-focused tests and smoke validation around stats-to-metrics wiring
+
+## Why this is a separate PR
+
+This is the cleanest slice to merge independently if observability is wanted
+before the rest of the runtime hardening stack is accepted.
+
+It also gives reviewers a narrow question:
+- "Do the exported counters and adapter semantics look correct?"
+
+## Reviewer focus
+
+Primary review targets:
+- metric names and labels
+- counter mapping correctness
+- whether zero/empty stats are handled safely
+- whether tests validate non-trivial observations
+
+Secondary review targets:
+- whether this should stay on the connector class or move elsewhere later
+
+## Main risks in this slice
+
+1. Naming churn:
+- if upstream naming conventions shift, this slice may need cosmetic changes.
+
+2. Double counting:
+- if stats reset/aggregation semantics are misunderstood, metrics can look right
+  in tests and still be misleading in production.
+
+## What this slice does not solve
+
+- scrape endpoint integration across a real server deployment
+- retention/export policy decisions
+- any connector correctness issue
 
 ## Validation checklist
 
@@ -42,6 +105,22 @@ Recommended:
 ```bash
 pytest -q tests/v1/worker/test_kv_phase6.py
 ```
+
+Additional targeted checks:
+```bash
+pytest -q tests/v1/worker/test_kv_phase6.py -k "prom or observe or counter"
+```
+
+## Suggested smoke environments
+
+Local CPU:
+- sufficient for almost all validation here
+
+Remote CUDA:
+- useful only if validating that connector stats are non-zero under real traffic
+
+Spyre cards:
+- not necessary for this slice alone
 
 ## Draft PR title
 
