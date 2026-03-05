@@ -20,6 +20,10 @@ move.
   [README.md](./README.md) or an appendix has at least one anchor showing
   where the mechanism exists in code, or where a limitation/workaround is
   visible in code.
+- Some claims in README are target-architecture statements rather than current
+  implementation facts. In those cases, the source map points either to the
+  closest existing mechanism or to the limitation/workaround that motivates the
+  target design.
 - Anchors use exact SHAs plus line ranges. If a range changes, update the
   range while preserving the anchor ID where practical.
 - Not every claim maps to one function. Some claims are cross-cutting and
@@ -29,11 +33,11 @@ move.
 
 | Seam | Anchor IDs | Why this matters |
 | --- | --- | --- |
-| Scheduler-owned control plane | `UP-SCHED-INIT`, `UP-SCHED-SCHEDULE`, `UP-SCHED-KV-META` | Shows where upstream owns connector creation, scheduling, and metadata handoff. |
+| Scheduler-owned control plane | `UP-SCHED-INIT`, `UP-SCHED-KVCM-INIT`, `UP-SCHED-SCHEDULE`, `UP-SCHED-KV-META` | Shows where upstream owns connector creation, cache-manager creation, scheduling, and metadata handoff. |
 | Block allocation and external KV tokens | `UP-KVCM-ALLOC`, `UP-SCHED-CONN-STEP` | Shows where external/computed tokens enter allocation and scheduling. |
 | Placement and slot mapping | `UP-BT-SLOTMAP`, `UP-ATTN-SLOTMAP` | Shows how block-table placement becomes token-level slot addresses. |
 | Upstream connector lifecycle | `UP-ACTIVE-PRE`, `UP-ACTIVE-POST`, `UP-ACTIVE-NOFWD` | Shows the native pre/after/no-forward lifecycle shape. |
-| Old-stack limitation | `OLD-DUMMY-KVSPEC` | Shows why old-stack integration is bridge-shaped rather than layer-native. |
+| Old-stack limitation | `OLD-DUMMY-KVSPEC`, `OLD-FMS-KV-PATH` | Shows why old-stack integration is bridge-shaped rather than layer-native. |
 | Experimental bridge lifecycle | `EXP-BRIDGE-BEGIN`, `EXP-BRIDGE-BEFORE`, `EXP-BRIDGE-AFTER`, `EXP-BRIDGE-FINISH` | Shows the explicit old-stack bridge phases. |
 | Metadata and store semantics | `EXP-META`, `EXP-META-VALIDATE`, `EXP-STORE` | Shows the scheduler-to-worker schema and the backing store abstraction. |
 | Experimental scheduler-side connector flow | `EXP-CONN-MATCH`, `EXP-CONN-AFTERALLOC`, `EXP-CONN-BUILDMETA` | Shows matching, allocation-state capture, and metadata construction. |
@@ -47,7 +51,7 @@ move.
 - `[UP-SCHED-INIT]` `Scheduler` initialization and connector creation
   - <https://github.com/vllm-project/vllm/blob/1892993bc18e243e2c05841314c5e9c06a80c70d/vllm/v1/core/sched/scheduler.py#L63-L130>
 
-- `Scheduler` creating `KVCacheManager`
+- `[UP-SCHED-KVCM-INIT]` `Scheduler` creating `KVCacheManager`
   - <https://github.com/vllm-project/vllm/blob/1892993bc18e243e2c05841314c5e9c06a80c70d/vllm/v1/core/sched/scheduler.py#L216-L228>
 
 - `[UP-SCHED-SCHEDULE]` `Scheduler.schedule()` unified token-progress model
@@ -148,6 +152,10 @@ move.
 
 - `[OLD-DUMMY-KVSPEC]` `get_kv_cache_spec()` dummy FMS-derived spec
   - <https://github.com/vllm-project/vllm-spyre/blob/8a9682897aa2bd4d77cf3fdab7acd3fbfe452a72/vllm_spyre/v1/worker/spyre_model_runner.py#L193-L219>
+
+- `[OLD-FMS-KV-PATH]` `SpyreCausalLM` owning `past_key_value_states` and passing them through the FMS forward path
+  - <https://github.com/vllm-project/vllm-spyre/blob/8a9682897aa2bd4d77cf3fdab7acd3fbfe452a72/vllm_spyre/model_executor/model_loader/spyre.py#L140-L142>
+  - <https://github.com/vllm-project/vllm-spyre/blob/8a9682897aa2bd4d77cf3fdab7acd3fbfe452a72/vllm_spyre/model_executor/model_loader/spyre.py#L343-L436>
 
 ## Experimental Spyre connector anchors
 
