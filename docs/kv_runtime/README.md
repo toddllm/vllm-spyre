@@ -1,6 +1,7 @@
 # KV Runtime Architecture
 
-This note is intended to be read directly on GitHub.
+This note is intended to be read directly on GitHub as a complete technical
+argument.
 
 It describes the durable architecture for KV offloading, KV sharing, and KV
 transfer across the current `vllm-spyre` stack and the future
@@ -11,6 +12,22 @@ For exact code and line references, use the companion
 
 For detailed state machines, capabilities, experiment paths, and open
 assumptions, use the appendices linked at the end of this note.
+
+## How to read this note
+
+This note is structured in three passes.
+
+1. `first principles`
+   What KV is, why it matters, and what the system must decide.
+2. `panoramic architecture`
+   The full runtime flow, ownership boundaries, and the old-stack vs future
+   stack split.
+3. `appendices`
+   Detailed lifecycle rules, identity/COW rules, capability requirements,
+   transport economics, and open assumptions.
+
+The core note should be enough to understand the architecture without opening
+any appendix. The appendices exist to make the design harder to misread.
 
 ## Why this note exists
 
@@ -84,6 +101,87 @@ A correct KV architecture therefore has to answer these questions:
 5. How do logical pages become movable regions?
 6. How does execution read and write the bytes correctly?
 
+## Why this matters technically
+
+The same architecture has to support several technically distinct situations:
+
+- `same-instance offload`
+  - prefill happens here
+  - decode later continues here
+  - KV may still be temporarily offloaded to host memory
+- `cross-instance continuation`
+  - prefill happens on one worker or instance
+  - decode later resumes elsewhere
+- `cold-start reuse`
+  - a new worker loads precomputed KV instead of rebuilding it
+- `shared-prefix reuse`
+  - multiple requests share the same stable prefix pages and later diverge
+
+Those are not identical workloads, but they all need the same foundational
+runtime contract:
+
+- stable logical identity
+- correct residency tracking
+- safe export/import lifecycle
+- reliable transport
+- correct data-plane consumption
+
+## Panoramic runtime flow
+
+This is the complete architecture in one flow.
+
+```text
+END-TO-END KV RUNTIME FLOW
+==========================
+
+(1) request arrives
+    |
+    v
+(2) scheduler allocates logical KV pages
+    |
+    v
+(3) prefill writes KV into those pages
+    |
+    v
+(4) runtime freezes written extent
+      WRITING -> STABLE_ON_DEVICE
+    |
+    v
+(5) runtime records residency
+      identity + extent + refcount + location=device
+    |
+    v
+(6) policy decides:
+      keep / offload / share / recompute later
+    |
+    v
+(7) if moving:
+      logical pages -> export/import region handles
+    |
+    v
+(8) transport moves batched regions
+      device <-> host <-> remote
+    |
+    v
+(9) residency updates reflect actual location/state
+    |
+    v
+(10) later continuation or reuse arrives
+     |
+     v
+(11) scheduler decides destination placement
+      block_ids + slot mapping for this step
+     |
+     v
+(12) destination pages are populated through import
+     |
+     v
+(13) decode consumes imported pages safely
+```
+
+This is the architectural center of the note. Everything else exists to make
+that flow safe and explain which subsystem owns which decision.
+
 ## Core model
 
 ```text
@@ -118,8 +216,8 @@ CAPABILITY LAYER
 The important point is that these are distinct concerns.
 
 The most dangerous failure mode is to collapse them into one vague “KV
-connector” concept. That usually hides bugs in identity, ownership, or
-lifetime.
+connector” concept. That usually hides bugs in identity, ownership, lifetime,
+or placement.
 
 ## Source identity vs destination placement
 
@@ -278,14 +376,90 @@ of:
 This is why `pr-759` matters even before full offloading or disaggregation is
 possible on the old stack.
 
+## Hook surfaces define the old-stack vs future-stack split
+
+The cleanest way to understand the current stack split is to compare hook
+surfaces.
+
+### Upstream-native hook surface
+
+At the model-runner level, upstream vLLM binds metadata, starts load, then
+finalizes after compute:
+
+```python
+kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
+kv_connector.start_load_kv(get_forward_context())
+...
+kv_connector.wait_for_save()
+...
+kv_connector.clear_connector_metadata()
+```
+
+Source:
+[vllm/v1/worker/kv_connector_model_runner_mixin.py#L77-L112](https://github.com/vllm-project/vllm/blob/1892993bc18e243e2c05841314c5e9c06a80c70d/vllm/v1/worker/kv_connector_model_runner_mixin.py#L77-L112)
+
+At the layer level, upstream attention waits for layer load and saves after the
+attention work finishes:
+
+```python
+connector.wait_for_layer_load(layer_name)
+result = func(*args, **kwargs)
+connector.save_kv_layer(layer_name, kv_cache, attn_metadata)
+```
+
+Source:
+[vllm/attention/utils/kv_transfer_utils.py#L14-L60](https://github.com/vllm-project/vllm/blob/1892993bc18e243e2c05841314c5e9c06a80c70d/vllm/attention/utils/kv_transfer_utils.py#L14-L60)
+
+### Old-stack hook surface
+
+The old FMS-shaped path does not naturally expose that per-layer seam, so the
+bridge has to reconstruct the lifecycle around `forward()`.
+
+The underlying limitation is visible in the old-stack model runner, which still
+returns a dummy FMS-derived KV spec rather than a native vLLM attention-backed
+spec:
+
+```python
+# The spyre modeling code currently comes from `fms`, and does not
+# integrate with vLLM's modeling classes ...
+# This just returns a dummy value for now.
+attn_spec = FullAttentionSpec(
+    block_size=block_size,
+    num_kv_heads=1,
+    head_size=1,
+    dtype=torch.float16,
+)
+return {"foo": attn_spec}
+```
+
+Source:
+[vllm_spyre/v1/worker/spyre_model_runner.py#L193-L219](https://github.com/vllm-project/vllm-spyre/blob/8a9682897aa2bd4d77cf3fdab7acd3fbfe452a72/vllm_spyre/v1/worker/spyre_model_runner.py#L193-L219)
+
+That is why old-stack work is useful but inherently transitional.
+
 ## Old stack vs future stack
 
 ### Old stack
 
-- control plane can become upstream-real once scheduler owns logical pages and
-  block-table semantics
-- data plane is still FMS-shaped and needs old-stack-specific hooks or
-  workarounds to expose KV in a usable way
+```text
+OLD STACK
+=========
+
+scheduler owns logical pages and metadata
+  ->
+worker/model runner receives scheduler output
+  ->
+current execution path does not naturally expose KV pages
+  ->
+old-stack-specific hooks or workarounds expose movable data
+  ->
+transport experiment proceeds
+```
+
+Properties:
+
+- control plane can become upstream-real
+- data plane still needs old-stack-specific visibility hooks
 - experimental work can validate identity, residency, lifecycle, batching, and
   failure semantics
 - compiler-artifact parsing and direct-address tricks should not define the
@@ -293,12 +467,53 @@ possible on the old stack.
 
 ### Future stack
 
+```text
+FUTURE STACK
+============
+
+scheduler owns logical pages and metadata
+  ->
+worker/model runner receive metadata through cleaner seams
+  ->
+runtime-visible page/region export/import becomes natural
+  ->
+transport attaches to a cleaner runtime contract
+```
+
+Properties:
+
 - control plane stays upstream-real
 - data plane should expose cleaner export/import and consumption seams
 - transport should attach to runtime-visible page/region concepts rather than
   old compiler workarounds
 - compiler/runtime should provide capabilities without owning reuse/offload
   policy
+
+## Durable vs experimental
+
+This is the most important filter for deciding what belongs in the architecture
+and what belongs in a temporary experiment.
+
+```text
+LIKELY DURABLE
+--------------
+- scheduler-owned logical page identity
+- source identity distinct from destination placement
+- residency tracking in runtime
+- sync/lifetime as a first-class contract
+- region handles rather than raw-address assumptions
+- batched transfer semantics
+- failure -> invalidation -> recompute fallback
+- shared-prefix refcount and COW rules
+
+LIKELY EXPERIMENTAL / TRANSITIONAL
+----------------------------------
+- compiler-artifact parsing
+- raw address reconstruction from old compiler state
+- old-stack-only visibility hooks
+- eager copy bridges used only to expose current-stack KV
+- any direct physical-address assumption baked into the stable API
+```
 
 ## Conformance invariants
 
