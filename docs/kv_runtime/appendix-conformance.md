@@ -28,6 +28,7 @@ cover across both old and future stacks.
 ## Transport conformance
 
 - retries do not silently corrupt state
+- retries under the same identity + epoch are idempotent
 - partial failure results in invalidation and recompute
 - release/unregister semantics prevent stale-handle reuse
 

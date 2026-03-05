@@ -267,6 +267,14 @@ In practice, this means residency tracking must carry at least:
 - whether a page is shareable/immutable
 - whether appending would require COW
 
+Refcount ownership belongs to the runtime residency layer, not to compiler
+internals. In a concrete implementation it may be maintained by the KV cache
+manager or a closely related coordinator, but it remains a runtime concern.
+
+Stable shared pages should be treated as immutable. A dirty tail page may still
+grow until it is explicitly frozen; after freeze, it should be considered
+immutable for export, reuse, and sharing purposes.
+
 ## Pages need extent and dirtiness, not just existence
 
 A page is not just present or absent.
@@ -308,6 +316,23 @@ Never consume before IMPORT completes.
 The detailed legal and illegal transitions are in
 [appendix-lifecycle.md](./appendix-lifecycle.md).
 
+## Retry safety and idempotency
+
+Export and import are not one-shot operations in a real system. Timeouts,
+retries, duplicate completions, and partial failures are expected transport
+behaviors.
+
+The core rule is:
+
+```text
+export/import must be retry-safe under the same source identity + epoch
+```
+
+Duplicate retries under the same identity and epoch must not change semantics
+or silently corrupt state. If correctness is uncertain, the safe fallback is to
+invalidate the destination placement and force recompute rather than silently
+reuse.
+
 ## Region handles, not raw addresses
 
 The durable abstraction should be exportable/importable region handles, not
@@ -316,7 +341,7 @@ bare raw addresses.
 A handle may represent:
 
 - one contiguous range
-- a scatter-gather list
+- one or more segments in a scatter-gather structure
 - registration metadata
 - alignment constraints
 - lifetime tokens
@@ -437,6 +462,10 @@ Source:
 
 That is why old-stack work is useful but inherently transitional.
 
+Until the data plane becomes more vLLM-native, old-stack connector integration
+is therefore necessarily bulk or bridge-shaped rather than true per-layer
+overlap.
+
 ## Old stack vs future stack
 
 ### Old stack
@@ -489,6 +518,31 @@ Properties:
 - compiler/runtime should provide capabilities without owning reuse/offload
   policy
 
+## What success looks like
+
+### Old stack success
+
+Old-stack work is successful if it validates the durable runtime contract:
+
+- scheduler-owned metadata and page identity flow
+- residency and lifecycle semantics
+- safe export/import boundaries
+- reliable invalidate-and-recompute fallback
+- batching and transport-threshold learning
+
+It is not necessary for old-stack work to define the final transport API or the
+final production performance model.
+
+### Future stack success
+
+Future-stack work is successful if it removes the bridge-shaped workaround and
+makes the critical seams native:
+
+- cleaner data-plane visibility of KV
+- cleaner per-layer or runtime-native export/import hooks
+- address resolution as a runtime-visible capability
+- transport integration without old compiler-artifact dependence
+
 ## Durable vs experimental
 
 This is the most important filter for deciding what belongs in the architecture
@@ -523,6 +577,7 @@ Any implementation of this model should be able to prove these invariants:
 - shared-prefix divergence respects COW boundaries
 - WRITING pages are never exported
 - decode never consumes before import completion
+- export/import retries under the same identity + epoch are idempotent
 - uncertain or failed loads degrade to invalidation and recompute rather than
   silent reuse
 - residency transitions remain legal under retry, timeout, or preemption
