@@ -18,7 +18,7 @@ The connector should surface granular success/failure and remain idempotent. The
 scheduler/runtime should own semantic policy such as retry, invalidate, or
 recompute.
 
-## What this page proves
+## What this page establishes
 
 - Upstream vLLM already provides a concrete scheduler-side and worker-side
   lifecycle for connectors.
@@ -40,8 +40,9 @@ Upstream scheduler calls the connector in an ordered sequence for:
 This means connector implementations should consume scheduler-owned metadata,
 not try to re-derive ownership from local state.
 
-Relevant anchors in [../source-map.md](../source-map.md): `UP-SCHED-CONN-STEP`,
-`UP-SCHED-KV-META`.
+Relevant anchors in [source-map.md](../source-map.md):
+[`UP-SCHED-CONN-STEP`](../source-map.md#up-sched-conn-step),
+[`UP-SCHED-KV-META`](../source-map.md#up-sched-kv-meta).
 
 ### 2. `KVConnectorBase_V1` defines separate scheduler and worker responsibilities
 
@@ -54,9 +55,11 @@ This is the right place to preserve a push/pull-neutral architecture. The
 connector contract should describe source identity, destination placement, and
 movement results, not hard-code one transport direction.
 
-Relevant anchors in [../source-map.md](../source-map.md): `UP-ACTIVE-PRE`,
-`UP-ACTIVE-POST`, `UP-ACTIVE-NOFWD` and the `KVConnectorBase_V1` references in
-that same source map section.
+Relevant anchors in [source-map.md](../source-map.md):
+[`UP-KVCONN-BASE`](../source-map.md#up-kvconn-base),
+[`UP-ACTIVE-PRE`](../source-map.md#up-active-pre),
+[`UP-ACTIVE-POST`](../source-map.md#up-active-post),
+[`UP-ACTIVE-NOFWD`](../source-map.md#up-active-nofwd).
 
 ### 3. The native worker-side lifecycle is explicit and narrow
 
@@ -71,8 +74,10 @@ Upstream `ActiveKVConnector` shows the intended worker lifecycle shape:
 That is the lifecycle old Spyre has to emulate while its data plane is still
 bridge-shaped.
 
-Relevant anchors in [../source-map.md](../source-map.md): `UP-ACTIVE-PRE`,
-`UP-ACTIVE-POST`, `UP-ACTIVE-NOFWD`.
+Relevant anchors in [source-map.md](../source-map.md):
+[`UP-ACTIVE-PRE`](../source-map.md#up-active-pre),
+[`UP-ACTIVE-POST`](../source-map.md#up-active-post),
+[`UP-ACTIVE-NOFWD`](../source-map.md#up-active-nofwd).
 
 ### 4. The old-stack bridge works because it makes the lifecycle explicit
 
@@ -87,9 +92,11 @@ That does not make it the final architecture. It just provides a safe place to
 mirror the upstream lifecycle while the current data plane cannot participate
 natively.
 
-Relevant anchors in [../source-map.md](../source-map.md):
-`EXP-BRIDGE-BEGIN`, `EXP-BRIDGE-BEFORE`, `EXP-BRIDGE-AFTER`,
-`EXP-BRIDGE-FINISH`.
+Relevant anchors in [source-map.md](../source-map.md):
+[`EXP-BRIDGE-BEGIN`](../source-map.md#exp-bridge-begin),
+[`EXP-BRIDGE-BEFORE`](../source-map.md#exp-bridge-before),
+[`EXP-BRIDGE-AFTER`](../source-map.md#exp-bridge-after),
+[`EXP-BRIDGE-FINISH`](../source-map.md#exp-bridge-finish).
 
 ### 5. Failure handling must end in explicit invalidation, not silent reuse
 
@@ -100,8 +107,10 @@ invalidate, or recompute.
 The key invariant is that uncertain loads degrade to explicit invalidation and
 recompute, never silent reuse.
 
-Relevant anchors in [../source-map.md](../source-map.md):
-`EXP-CONN-LOADERR`, `EXP-CONN-FINISH`, `UP-SCHED-CONN-STEP`.
+Relevant anchors in [source-map.md](../source-map.md):
+[`EXP-CONN-LOADERR`](../source-map.md#exp-conn-loaderr),
+[`EXP-CONN-FINISH`](../source-map.md#exp-conn-finish),
+[`UP-SCHED-CONN-STEP`](../source-map.md#up-sched-conn-step).
 
 ## What differs in old stack
 
@@ -124,17 +133,18 @@ These parts should survive directly:
 
 ## Relevant anchors in `source-map.md`
 
-- `UP-SCHED-KV-META`
-- `UP-SCHED-CONN-STEP`
-- `UP-ACTIVE-PRE`
-- `UP-ACTIVE-POST`
-- `UP-ACTIVE-NOFWD`
-- `EXP-BRIDGE-BEGIN`
-- `EXP-BRIDGE-BEFORE`
-- `EXP-BRIDGE-AFTER`
-- `EXP-BRIDGE-FINISH`
-- `EXP-CONN-BIND`
-- `EXP-CONN-LOAD`
-- `EXP-CONN-SAVE`
-- `EXP-CONN-FINISH`
-- `EXP-CONN-LOADERR`
+- [`UP-KVCONN-BASE`](../source-map.md#up-kvconn-base)
+- [`UP-SCHED-KV-META`](../source-map.md#up-sched-kv-meta)
+- [`UP-SCHED-CONN-STEP`](../source-map.md#up-sched-conn-step)
+- [`UP-ACTIVE-PRE`](../source-map.md#up-active-pre)
+- [`UP-ACTIVE-POST`](../source-map.md#up-active-post)
+- [`UP-ACTIVE-NOFWD`](../source-map.md#up-active-nofwd)
+- [`EXP-BRIDGE-BEGIN`](../source-map.md#exp-bridge-begin)
+- [`EXP-BRIDGE-BEFORE`](../source-map.md#exp-bridge-before)
+- [`EXP-BRIDGE-AFTER`](../source-map.md#exp-bridge-after)
+- [`EXP-BRIDGE-FINISH`](../source-map.md#exp-bridge-finish)
+- [`EXP-CONN-BIND`](../source-map.md#exp-conn-bind)
+- [`EXP-CONN-LOAD`](../source-map.md#exp-conn-load)
+- [`EXP-CONN-SAVE`](../source-map.md#exp-conn-save)
+- [`EXP-CONN-FINISH`](../source-map.md#exp-conn-finish)
+- [`EXP-CONN-LOADERR`](../source-map.md#exp-conn-loaderr)

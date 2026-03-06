@@ -18,14 +18,15 @@ the canonical control-plane contract.
 upstream block identity and block-table semantics the source of truth, even
 though the FMS path still owns the actual KV bytes.
 
-## What this page proves
+## What this page establishes
 
 - Upstream vLLM models prefill and decode through one token-progress scheduler,
   not separate phase schedulers.
 - Upstream `KVCacheManager` and `BlockTable` own logical block allocation and
   slot mapping.
-- Old `vllm-spyre` divergence should be understood as a data-plane and policy
-  divergence layered on top of this upstream control-plane baseline.
+- Old `vllm-spyre` divergence should be understood primarily as a data-plane
+  divergence, plus some scheduler/policy adaptations, layered on top of this
+  upstream control-plane baseline.
 
 ## Story snippets
 
@@ -37,8 +38,11 @@ allocation, not around a hard prefill/decode split.
 That matters because chunked prefill, prefix reuse, offload, and connector
 metadata all hang off the same scheduling loop.
 
-Relevant anchors in [../source-map.md](../source-map.md): `UP-SCHED-INIT`,
-`UP-SCHED-KVCM-INIT`, `UP-SCHED-SCHEDULE`, `UP-SCHED-KV-META`.
+Relevant anchors in [source-map.md](../source-map.md):
+[`UP-SCHED-INIT`](../source-map.md#up-sched-init),
+[`UP-SCHED-KVCM-INIT`](../source-map.md#up-sched-kvcm-init),
+[`UP-SCHED-SCHEDULE`](../source-map.md#up-sched-schedule),
+[`UP-SCHED-KV-META`](../source-map.md#up-sched-kv-meta).
 
 ### 2. The KV cache manager allocates logical blocks, including external KV cases
 
@@ -50,8 +54,9 @@ This is the right place to think about offload/reload integration because the
 scheduler is already deciding how many tokens are local versus externally
 available.
 
-Relevant anchors in [../source-map.md](../source-map.md): `UP-KVCM-ALLOC`,
-`UP-SCHED-CONN-STEP`.
+Relevant anchors in [source-map.md](../source-map.md):
+[`UP-KVCM-ALLOC`](../source-map.md#up-kvcm-alloc),
+[`UP-SCHED-CONN-STEP`](../source-map.md#up-sched-conn-step).
 
 ### 3. Block table plus slot mapping is the canonical address contract
 
@@ -62,8 +67,9 @@ consume.
 That means any backend or connector path that bypasses slot mapping is no longer
 following upstream placement semantics.
 
-Relevant anchors in [../source-map.md](../source-map.md): `UP-BT-SLOTMAP`,
-`UP-ATTN-SLOTMAP`.
+Relevant anchors in [source-map.md](../source-map.md):
+[`UP-BT-SLOTMAP`](../source-map.md#up-bt-slotmap),
+[`UP-ATTN-SLOTMAP`](../source-map.md#up-attn-slotmap).
 
 ### 4. `pr-759` aligns old Spyre to upstream block identity without yet changing byte ownership
 
@@ -74,8 +80,10 @@ truth for block identity and block-table semantics.
 That is what makes connector metadata and scheduler-owned placement credible on
 old Spyre, even while the FMS path still owns the underlying KV tensors.
 
-Relevant anchors in [../source-map.md](../source-map.md): `UP-SCHED-CONN-STEP`,
-`OLD-DUMMY-KVSPEC`, `OLD-FMS-KV-PATH`.
+Relevant anchors in [source-map.md](../source-map.md):
+[`UP-SCHED-CONN-STEP`](../source-map.md#up-sched-conn-step),
+[`OLD-DUMMY-KVSPEC`](../source-map.md#old-dummy-kvspec),
+[`OLD-FMS-KV-PATH`](../source-map.md#old-fms-kv-path).
 
 ## What differs in old stack
 
@@ -102,13 +110,13 @@ These parts should carry forward unchanged in spirit:
 
 ## Relevant anchors in `source-map.md`
 
-- `UP-SCHED-INIT`
-- `UP-SCHED-KVCM-INIT`
-- `UP-SCHED-SCHEDULE`
-- `UP-SCHED-KV-META`
-- `UP-KVCM-ALLOC`
-- `UP-BT-SLOTMAP`
-- `UP-ATTN-SLOTMAP`
-- `UP-SCHED-CONN-STEP`
-- `OLD-DUMMY-KVSPEC`
-- `OLD-FMS-KV-PATH`
+- [`UP-SCHED-INIT`](../source-map.md#up-sched-init)
+- [`UP-SCHED-KVCM-INIT`](../source-map.md#up-sched-kvcm-init)
+- [`UP-SCHED-SCHEDULE`](../source-map.md#up-sched-schedule)
+- [`UP-SCHED-KV-META`](../source-map.md#up-sched-kv-meta)
+- [`UP-KVCM-ALLOC`](../source-map.md#up-kvcm-alloc)
+- [`UP-BT-SLOTMAP`](../source-map.md#up-bt-slotmap)
+- [`UP-ATTN-SLOTMAP`](../source-map.md#up-attn-slotmap)
+- [`UP-SCHED-CONN-STEP`](../source-map.md#up-sched-conn-step)
+- [`OLD-DUMMY-KVSPEC`](../source-map.md#old-dummy-kvspec)
+- [`OLD-FMS-KV-PATH`](../source-map.md#old-fms-kv-path)

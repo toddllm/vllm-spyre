@@ -19,7 +19,7 @@ A correctness-first Spyre backend is feasible if it consumes upstream placement
 metadata directly and proves shape/stride correctness before attempting any
 kernel-native optimization.
 
-## What this page proves
+## What this page establishes
 
 - Upstream attention backends are given an explicit KV cache
   shape/stride/metadata contract.
@@ -38,8 +38,10 @@ expects backends to consume shared metadata fields.
 That means a backend can be slow and still correct, but it cannot be casual
 about metadata semantics.
 
-Relevant anchors in [../source-map.md](../source-map.md): `UP-ATTN-BACKEND`,
-`UP-ATTN-CPU`, `UP-ATTN-SLOTMAP`.
+Relevant anchors in [source-map.md](../source-map.md):
+[`UP-ATTN-BACKEND`](../source-map.md#up-attn-backend),
+[`UP-ATTN-CPU`](../source-map.md#up-attn-cpu),
+[`UP-ATTN-SLOTMAP`](../source-map.md#up-attn-slotmap).
 
 ### 2. Slot mapping is how placement becomes execution
 
@@ -50,8 +52,9 @@ and write positions.
 This is the boundary where many “we know the block IDs” stories fail: block IDs
 alone are not enough to execute the attention update correctly.
 
-Relevant anchors in [../source-map.md](../source-map.md): `UP-BT-SLOTMAP`,
-`UP-ATTN-SLOTMAP`.
+Relevant anchors in [source-map.md](../source-map.md):
+[`UP-BT-SLOTMAP`](../source-map.md#up-bt-slotmap),
+[`UP-ATTN-SLOTMAP`](../source-map.md#up-attn-slotmap).
 
 ### 3. CPU backend behavior shows the contract can be proved before optimization
 
@@ -62,8 +65,9 @@ reference behavior for correctness-first comparisons.
 This is the right model for early Spyre work: prove conformance first, then
 optimize layout and kernel strategy.
 
-Relevant anchors in [../source-map.md](../source-map.md): `UP-ATTN-CPU`,
-`UP-ATTN-BACKEND`.
+Relevant anchors in [source-map.md](../source-map.md):
+[`UP-ATTN-CPU`](../source-map.md#up-attn-cpu),
+[`UP-ATTN-BACKEND`](../source-map.md#up-attn-backend).
 
 ### 4. CUDA kernels show the physical layout assumptions that matter later
 
@@ -76,8 +80,10 @@ The CUDA paged-attention kernels encode concrete assumptions about:
 Spyre does not need to match those assumptions physically on day one, but it
 does need to match them logically or translate them explicitly.
 
-Relevant anchors in [../source-map.md](../source-map.md): `UP-CUDA-KV-SHAPE`,
-`UP-CUDA-PAGED-V1`, `UP-CUDA-PAGED-V2`.
+Relevant anchors in [source-map.md](../source-map.md):
+[`UP-CUDA-KV-SHAPE`](../source-map.md#up-cuda-kv-shape),
+[`UP-CUDA-PAGED-V1`](../source-map.md#up-cuda-paged-v1),
+[`UP-CUDA-PAGED-V2`](../source-map.md#up-cuda-paged-v2).
 
 ### 5. Old Spyre remains awkward here because the current data plane is still FMS-shaped
 
@@ -88,8 +94,9 @@ placement metadata, it is not yet a native vLLM attention backend.
 That is why old-stack correctness work tends to look like translation or bridge
 logic rather than a clean backend implementation.
 
-Relevant anchors in [../source-map.md](../source-map.md): `OLD-DUMMY-KVSPEC`,
-`OLD-FMS-KV-PATH`.
+Relevant anchors in [source-map.md](../source-map.md):
+[`OLD-DUMMY-KVSPEC`](../source-map.md#old-dummy-kvspec),
+[`OLD-FMS-KV-PATH`](../source-map.md#old-fms-kv-path).
 
 ## What differs in old stack
 
@@ -114,12 +121,12 @@ These parts should survive directly:
 
 ## Relevant anchors in `source-map.md`
 
-- `UP-ATTN-BACKEND`
-- `UP-ATTN-CPU`
-- `UP-BT-SLOTMAP`
-- `UP-ATTN-SLOTMAP`
-- `UP-CUDA-KV-SHAPE`
-- `UP-CUDA-PAGED-V1`
-- `UP-CUDA-PAGED-V2`
-- `OLD-DUMMY-KVSPEC`
-- `OLD-FMS-KV-PATH`
+- [`UP-ATTN-BACKEND`](../source-map.md#up-attn-backend)
+- [`UP-ATTN-CPU`](../source-map.md#up-attn-cpu)
+- [`UP-BT-SLOTMAP`](../source-map.md#up-bt-slotmap)
+- [`UP-ATTN-SLOTMAP`](../source-map.md#up-attn-slotmap)
+- [`UP-CUDA-KV-SHAPE`](../source-map.md#up-cuda-kv-shape)
+- [`UP-CUDA-PAGED-V1`](../source-map.md#up-cuda-paged-v1)
+- [`UP-CUDA-PAGED-V2`](../source-map.md#up-cuda-paged-v2)
+- [`OLD-DUMMY-KVSPEC`](../source-map.md#old-dummy-kvspec)
+- [`OLD-FMS-KV-PATH`](../source-map.md#old-fms-kv-path)

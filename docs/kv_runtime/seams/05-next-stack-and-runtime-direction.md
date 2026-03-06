@@ -21,7 +21,7 @@ hooks. But the runtime still has important copy, fallback, stream, and event
 gaps that keep this in “correctness-first and capability-building” territory
 rather than “production-complete data plane.”
 
-## What this page proves
+## What this page establishes
 
 - `vllm-spyre-next` is not just a placeholder idea; it already has a concrete
   platform scaffold and example path.
@@ -42,8 +42,9 @@ will eventually go.
 That is exactly what a scaffold should do: provide a real seam without
 pretending feature parity exists already.
 
-Relevant anchors in [../source-map.md](../source-map.md): `NEXT-PLATFORM`,
-`NEXT-EXAMPLE`.
+Relevant anchors in [source-map.md](../source-map.md):
+[`NEXT-PLATFORM`](../source-map.md#next-platform),
+[`NEXT-EXAMPLE`](../source-map.md#next-example).
 
 ### 2. The current next-stack example is still CPU-path baseline, not full Spyre execution
 
@@ -54,7 +55,8 @@ level correctly.
 The point of this path today is to validate extension seams and runtime shape,
 not to overstate device readiness.
 
-Relevant anchors in [../source-map.md](../source-map.md): `NEXT-EXAMPLE`.
+Relevant anchors in [source-map.md](../source-map.md):
+[`NEXT-EXAMPLE`](../source-map.md#next-example).
 
 ### 3. `torch-spyre` already registers a real backend and PrivateUse1 device module
 
@@ -66,8 +68,9 @@ The backend registration path is concrete:
 That means the future stack is building on real runtime integration points, not
 just conceptual placeholders.
 
-Relevant anchors in [../source-map.md](../source-map.md): `TS-ENTRYPOINT`,
-`TS-BACKEND-REGISTER`.
+Relevant anchors in [source-map.md](../source-map.md):
+[`TS-ENTRYPOINT`](../source-map.md#ts-entrypoint),
+[`TS-BACKEND-REGISTER`](../source-map.md#ts-backend-register).
 
 ### 4. Inductor integration is real, but it is still patch-heavy
 
@@ -81,7 +84,8 @@ Relevant anchors in [../source-map.md](../source-map.md): `TS-ENTRYPOINT`,
 That is evidence of real integration, but it is also evidence that the current
 runtime path is still carrying significant custom integration weight.
 
-Relevant anchors in [../source-map.md](../source-map.md): `TS-INDUCTOR-AUTOLOAD`.
+Relevant anchors in [source-map.md](../source-map.md):
+[`TS-INDUCTOR-AUTOLOAD`](../source-map.md#ts-inductor-autoload).
 
 ### 5. The remaining runtime gaps are concrete and directly relevant to KV movement
 
@@ -95,8 +99,12 @@ The runtime limitations are not abstract:
 Those are exactly the kinds of gaps that matter for offload, import/export, and
 asynchronous transfer semantics.
 
-Relevant anchors in [../source-map.md](../source-map.md): `TS-FALLBACKS`,
-`TS-PRELOAD`, `TS-COPY`, `TS-COPY-FIXME`, `TS-HOOKS-STREAM`.
+Relevant anchors in [source-map.md](../source-map.md):
+[`TS-FALLBACKS`](../source-map.md#ts-fallbacks),
+[`TS-PRELOAD`](../source-map.md#ts-preload),
+[`TS-COPY`](../source-map.md#ts-copy),
+[`TS-COPY-FIXME`](../source-map.md#ts-copy-fixme),
+[`TS-HOOKS-STREAM`](../source-map.md#ts-hooks-stream).
 
 ## What differs from old stack
 
@@ -122,13 +130,13 @@ These parts should survive directly:
 
 ## Relevant anchors in `source-map.md`
 
-- `NEXT-PLATFORM`
-- `NEXT-EXAMPLE`
-- `TS-ENTRYPOINT`
-- `TS-BACKEND-REGISTER`
-- `TS-INDUCTOR-AUTOLOAD`
-- `TS-FALLBACKS`
-- `TS-PRELOAD`
-- `TS-COPY`
-- `TS-COPY-FIXME`
-- `TS-HOOKS-STREAM`
+- [`NEXT-PLATFORM`](../source-map.md#next-platform)
+- [`NEXT-EXAMPLE`](../source-map.md#next-example)
+- [`TS-ENTRYPOINT`](../source-map.md#ts-entrypoint)
+- [`TS-BACKEND-REGISTER`](../source-map.md#ts-backend-register)
+- [`TS-INDUCTOR-AUTOLOAD`](../source-map.md#ts-inductor-autoload)
+- [`TS-FALLBACKS`](../source-map.md#ts-fallbacks)
+- [`TS-PRELOAD`](../source-map.md#ts-preload)
+- [`TS-COPY`](../source-map.md#ts-copy)
+- [`TS-COPY-FIXME`](../source-map.md#ts-copy-fixme)
+- [`TS-HOOKS-STREAM`](../source-map.md#ts-hooks-stream)
