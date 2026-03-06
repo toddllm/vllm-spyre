@@ -621,6 +621,14 @@ decision-oriented narratives for the highest-value integration boundaries.
   [seams/04-old-stack-divergences.md](./seams/04-old-stack-divergences.md)
 - next-stack and runtime direction:
   [seams/05-next-stack-and-runtime-direction.md](./seams/05-next-stack-and-runtime-direction.md)
+- identity, placement, and residency:
+  [seams/06-identity-placement-and-residency.md](./seams/06-identity-placement-and-residency.md)
+- export, import, and transport:
+  [seams/07-export-import-and-transport.md](./seams/07-export-import-and-transport.md)
+- sync, lifetime, and materialized coverage:
+  [seams/08-sync-lifetime-and-coverage.md](./seams/08-sync-lifetime-and-coverage.md)
+- failure, invalidation, and recompute:
+  [seams/09-failure-invalidation-and-recompute.md](./seams/09-failure-invalidation-and-recompute.md)
 
 Those pages are intentionally narrative summaries, not replacements for the
 pinned reference appendix in [source-map.md](./source-map.md).

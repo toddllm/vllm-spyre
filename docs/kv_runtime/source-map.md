@@ -42,6 +42,9 @@ move.
 | Old-stack limitation | `OLD-DUMMY-KVSPEC`, `OLD-FMS-KV-PATH` | Shows why old-stack integration is bridge-shaped rather than layer-native. |
 | Experimental bridge lifecycle | `EXP-BRIDGE-BEGIN`, `EXP-BRIDGE-BEFORE`, `EXP-BRIDGE-AFTER`, `EXP-BRIDGE-FINISH` | Shows the explicit old-stack bridge phases. |
 | Metadata and store semantics | `EXP-META`, `EXP-META-VALIDATE`, `EXP-STORE` | Shows the scheduler-to-worker schema and the backing store abstraction. |
+| Identity, placement, and residency | `UP-BT-SLOTMAP`, `UP-SCHED-CONN-STEP`, `EXP-STOREKEY`, `EXP-REQ-META`, `EXP-META`, `EXP-META-VALIDATE`, `EXP-STORE`, `EXP-CONN-AFTERALLOC`, `EXP-CONN-BUILDMETA` | Shows the difference between source identity and destination placement, plus the runtime metadata and store layer that make residency explicit. |
+| Export/import and transport | `UP-KVCONN-BASE`, `UP-KVCONN-CROSSLAYER`, `EXP-CONN-REGISTER-CACHES`, `EXP-CONN-LOAD`, `EXP-CONN-SAVE`, `EXP-STORE`, `TS-COPY`, `TS-COPY-FIXME`, `TS-HOOKS-STREAM` | Shows the descriptor-to-worker movement seam, batching hints, and the current runtime copy/stream limitations that motivate region-handle thinking. |
+| Sync/lifetime and materialized coverage | `UP-XFER-LAYER`, `UP-ACTIVE-PRE`, `UP-ACTIVE-POST`, `UP-ACTIVE-NOFWD`, `EXP-BRIDGE-BEGIN`, `EXP-BRIDGE-AFTER`, `EXP-BRIDGE-FINISH`, `EXP-CONN-FINISH`, `EXP-CONN-LOADERR` | Shows that lifecycle and invalidation semantics must be explicit and per-operation rather than implicit in request flow. |
 | Experimental scheduler-side connector flow | `EXP-CONN-MATCH`, `EXP-CONN-AFTERALLOC`, `EXP-CONN-BUILDMETA` | Shows matching, allocation-state capture, and metadata construction. |
 | Experimental worker-side connector flow | `EXP-CONN-BIND`, `EXP-CONN-LOAD`, `EXP-CONN-SAVE`, `EXP-CONN-FINISH` | Shows binding, load, save, and completion handling. |
 | Failure and recompute fallback | `UP-SCHED-CONN-STEP`, `EXP-BRIDGE-AFTER`, `EXP-CONN-LOADERR`, `EXP-CONN-FINISH` | Shows how load errors surface as invalid block IDs and completion state rather than silent reuse. |
@@ -55,6 +58,10 @@ move.
 | `seams/03-kv-connector-lifecycle.md` | `UP-SCHED-KV-META`, `UP-SCHED-CONN-STEP`, `UP-ACTIVE-PRE`, `UP-ACTIVE-POST`, `UP-ACTIVE-NOFWD`, `EXP-BRIDGE-BEGIN`, `EXP-BRIDGE-BEFORE`, `EXP-BRIDGE-AFTER`, `EXP-BRIDGE-FINISH`, `EXP-CONN-BIND`, `EXP-CONN-LOAD`, `EXP-CONN-SAVE`, `EXP-CONN-FINISH`, `EXP-CONN-LOADERR` | Shows the split between scheduler-owned lifecycle, worker-side connector phases, bridge-shaped old-stack adaptation, and explicit failure/recompute fallback. |
 | `seams/04-old-stack-divergences.md` | `UP-SCHED-SCHEDULE`, `UP-SCHED-CONN-STEP`, `OLD-DUMMY-KVSPEC`, `OLD-FMS-KV-PATH`, `EXP-BRIDGE-BEGIN`, `EXP-BRIDGE-BEFORE`, `EXP-BRIDGE-AFTER`, `EXP-BRIDGE-FINISH` | Shows why old `vllm-spyre` remains bridge-shaped around an FMS-owned data plane and which parts are transitional rather than durable. |
 | `seams/05-next-stack-and-runtime-direction.md` | `NEXT-PLATFORM`, `NEXT-EXAMPLE`, `TS-ENTRYPOINT`, `TS-BACKEND-REGISTER`, `TS-INDUCTOR-AUTOLOAD`, `TS-FALLBACKS`, `TS-PRELOAD`, `TS-COPY`, `TS-COPY-FIXME`, `TS-HOOKS-STREAM` | Shows that next-stack scaffolding and torch-spyre backend integration are real today, while copy/stream/event gaps still limit the future stack’s runtime maturity. |
+| `seams/06-identity-placement-and-residency.md` | `UP-BT-SLOTMAP`, `UP-SCHED-CONN-STEP`, `EXP-STOREKEY`, `EXP-REQ-META`, `EXP-META`, `EXP-META-VALIDATE`, `EXP-STORE`, `EXP-CONN-MATCH`, `EXP-CONN-AFTERALLOC`, `EXP-CONN-BUILDMETA` | Shows the difference between source identity and destination placement, plus the experimental metadata and store mechanisms that make residency/state explicit. |
+| `seams/07-export-import-and-transport.md` | `UP-KVCONN-BASE`, `UP-KVCONN-CROSSLAYER`, `EXP-CONN-REGISTER-CACHES`, `EXP-CONN-LOAD`, `EXP-CONN-SAVE`, `EXP-STORE`, `TS-COPY`, `TS-COPY-FIXME`, `TS-HOOKS-STREAM` | Shows the seam between logical page decisions and byte movement, why transport should stay push/pull-neutral, and where current runtime capability gaps still sit. |
+| `seams/08-sync-lifetime-and-coverage.md` | `UP-XFER-LAYER`, `UP-ACTIVE-PRE`, `UP-ACTIVE-POST`, `UP-ACTIVE-NOFWD`, `EXP-BRIDGE-BEGIN`, `EXP-BRIDGE-AFTER`, `EXP-BRIDGE-FINISH`, `EXP-CONN-FINISH`, `EXP-CONN-LOADERR` | Shows that exportability and consumability depend on explicit lifecycle state, not on loose request-level intuition. |
+| `seams/09-failure-invalidation-and-recompute.md` | `UP-SCHED-CONN-STEP`, `UP-ACTIVE-POST`, `UP-ACTIVE-NOFWD`, `EXP-CONN-LOADERR`, `EXP-CONN-FINISH`, `EXP-BRIDGE-AFTER` | Shows where failure feedback is surfaced and why the only safe fallback is invalidation/recompute rather than silent reuse. |
 
 ## Upstream vLLM anchors
 
@@ -118,7 +125,9 @@ move.
 - `[UP-KVCONN-BASE]` `KVConnectorBase_V1` declaration and worker-side methods
   - <https://github.com/vllm-project/vllm/blob/1892993bc18e243e2c05841314c5e9c06a80c70d/vllm/distributed/kv_transfer/kv_connector/v1/base.py#L147-L320>
 
-- `prefer_cross_layer_blocks`
+<a id="up-kvconn-crosslayer"></a>
+
+- `[UP-KVCONN-CROSSLAYER]` `prefer_cross_layer_blocks`
   - <https://github.com/vllm-project/vllm/blob/1892993bc18e243e2c05841314c5e9c06a80c70d/vllm/distributed/kv_transfer/kv_connector/v1/base.py#L152-L159>
 
 ### Model-runner lifecycle seam
@@ -131,7 +140,9 @@ move.
 
 ### Layer-level transfer seam
 
-- `maybe_transfer_kv_layer`
+<a id="up-xfer-layer"></a>
+
+- `[UP-XFER-LAYER]` `maybe_transfer_kv_layer`
   - <https://github.com/vllm-project/vllm/blob/1892993bc18e243e2c05841314c5e9c06a80c70d/vllm/attention/utils/kv_transfer_utils.py#L14-L60>
 
 <a id="up-attn-slotmap"></a>
@@ -318,10 +329,14 @@ move.
 
 ### Metadata contract
 
-- `StoreKey`
+<a id="exp-storekey"></a>
+
+- `[EXP-STOREKEY]` `StoreKey`
   - <https://github.com/toddllm/vllm-spyre/blob/3448cf95710f69e0f13fac000ab170670ad5268d/vllm_spyre/distributed/kv_transfer/kv_connector/v1/metadata.py#L38-L67>
 
-- `SpyreConnectorRequestMeta`
+<a id="exp-req-meta"></a>
+
+- `[EXP-REQ-META]` `SpyreConnectorRequestMeta`
   - <https://github.com/toddllm/vllm-spyre/blob/3448cf95710f69e0f13fac000ab170670ad5268d/vllm_spyre/distributed/kv_transfer/kv_connector/v1/metadata.py#L100-L120>
 
 <a id="exp-meta"></a>
@@ -346,7 +361,9 @@ move.
 
 ### Connector worker-side lifecycle
 
-- `register_kv_caches()`
+<a id="exp-conn-register-caches"></a>
+
+- `[EXP-CONN-REGISTER-CACHES]` `register_kv_caches()`
   - <https://github.com/toddllm/vllm-spyre/blob/3448cf95710f69e0f13fac000ab170670ad5268d/vllm_spyre/distributed/kv_transfer/kv_connector/v1/inmemory_spyre_connector.py#L318-L344>
 
 <a id="exp-conn-bind"></a>

@@ -33,3 +33,15 @@ anchors.
 - [05. Next-Stack and Runtime Direction](./05-next-stack-and-runtime-direction.md)
   - What is already real in `vllm-spyre-next` and `torch-spyre`, and which
     runtime gaps still separate the future stack from a complete KV data plane.
+- [06. Identity, Placement, and Residency](./06-identity-placement-and-residency.md)
+  - Why source identity, destination placement, and runtime residency are
+    different layers, and where current code already begins to expose them.
+- [07. Export, Import, and Transport](./07-export-import-and-transport.md)
+  - How logical page decisions turn into byte movement, why transport should
+    stay push/pull-neutral, and where current runtime capability gaps still sit.
+- [08. Sync, Lifetime, and Materialized Coverage](./08-sync-lifetime-and-coverage.md)
+  - When KV becomes exportable or consumable, why lifecycle must be explicit,
+    and why “page exists” is not enough.
+- [09. Failure, Invalidation, and Recompute](./09-failure-invalidation-and-recompute.md)
+  - Where failure feedback is surfaced and why the only safe fallback is
+    invalidation/recompute rather than silent reuse.
