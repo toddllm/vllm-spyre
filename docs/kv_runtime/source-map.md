@@ -13,6 +13,8 @@ move.
 | `vllm-project/vllm` | upstream runtime, scheduler, attention, connector APIs | `1892993bc18e243e2c05841314c5e9c06a80c70d` |
 | `vllm-project/vllm-spyre` | old-stack `pr-759` review base | `8a9682897aa2bd4d77cf3fdab7acd3fbfe452a72` |
 | `toddllm/vllm-spyre` | experimental combined Spyre connector implementation | `3448cf95710f69e0f13fac000ab170670ad5268d` |
+| `toddllm/vllm-spyre` | current next-stack scaffold snapshot used by these docs | `5aeb39ec813ff01161ec8f3a832fc86f676238c8` |
+| `toddllm/torch-spyre` | current torch-spyre runtime/backend snapshot used by these docs | `6782329492de7558098ec17cd1260d4aab8d93ad` |
 
 ## Traceability rules
 
@@ -49,8 +51,10 @@ move.
 | Seam page | Anchor IDs | Why this supports the page |
 | --- | --- | --- |
 | `seams/01-scheduler-block-manager.md` | `UP-SCHED-INIT`, `UP-SCHED-KVCM-INIT`, `UP-SCHED-SCHEDULE`, `UP-SCHED-KV-META`, `UP-KVCM-ALLOC`, `UP-BT-SLOTMAP`, `UP-ATTN-SLOTMAP`, `UP-SCHED-CONN-STEP`, `OLD-DUMMY-KVSPEC`, `OLD-FMS-KV-PATH` | Shows upstream control-plane ownership of scheduling and placement, plus the old-stack limitation that keeps byte ownership in the FMS path. |
+| `seams/02-attention-slot-mapping.md` | `UP-ATTN-BACKEND`, `UP-ATTN-CPU`, `UP-BT-SLOTMAP`, `UP-ATTN-SLOTMAP`, `UP-CUDA-KV-SHAPE`, `UP-CUDA-PAGED-V1`, `UP-CUDA-PAGED-V2`, `OLD-DUMMY-KVSPEC`, `OLD-FMS-KV-PATH` | Shows the explicit backend contract, how slot mapping becomes execution, and why old stack still needs FMS-shaped translation rather than a native backend seam. |
 | `seams/03-kv-connector-lifecycle.md` | `UP-SCHED-KV-META`, `UP-SCHED-CONN-STEP`, `UP-ACTIVE-PRE`, `UP-ACTIVE-POST`, `UP-ACTIVE-NOFWD`, `EXP-BRIDGE-BEGIN`, `EXP-BRIDGE-BEFORE`, `EXP-BRIDGE-AFTER`, `EXP-BRIDGE-FINISH`, `EXP-CONN-BIND`, `EXP-CONN-LOAD`, `EXP-CONN-SAVE`, `EXP-CONN-FINISH`, `EXP-CONN-LOADERR` | Shows the split between scheduler-owned lifecycle, worker-side connector phases, bridge-shaped old-stack adaptation, and explicit failure/recompute fallback. |
 | `seams/04-old-stack-divergences.md` | `UP-SCHED-SCHEDULE`, `UP-SCHED-CONN-STEP`, `OLD-DUMMY-KVSPEC`, `OLD-FMS-KV-PATH`, `EXP-BRIDGE-BEGIN`, `EXP-BRIDGE-BEFORE`, `EXP-BRIDGE-AFTER`, `EXP-BRIDGE-FINISH` | Shows why old `vllm-spyre` remains bridge-shaped around an FMS-owned data plane and which parts are transitional rather than durable. |
+| `seams/05-next-stack-and-runtime-direction.md` | `NEXT-PLATFORM`, `NEXT-EXAMPLE`, `TS-ENTRYPOINT`, `TS-BACKEND-REGISTER`, `TS-INDUCTOR-AUTOLOAD`, `TS-FALLBACKS`, `TS-PRELOAD`, `TS-COPY`, `TS-COPY-FIXME`, `TS-HOOKS-STREAM` | Shows that next-stack scaffolding and torch-spyre backend integration are real today, while copy/stream/event gaps still limit the future stack’s runtime maturity. |
 
 ## Upstream vLLM anchors
 
@@ -136,6 +140,21 @@ move.
 - `FlashAttentionBackend.get_kv_cache_stride_order`
   - <https://github.com/vllm-project/vllm/blob/1892993bc18e243e2c05841314c5e9c06a80c70d/vllm/v1/attention/backends/flash_attn.py#L119-L137>
 
+- `[UP-ATTN-BACKEND]` `AttentionBackend` contract and metadata-facing methods
+  - <https://github.com/vllm-project/vllm/blob/1892993bc18e243e2c05841314c5e9c06a80c70d/vllm/v1/attention/backend.py#L21-L166>
+
+- `[UP-ATTN-CPU]` CPU backend using shared attention metadata
+  - <https://github.com/vllm-project/vllm/blob/1892993bc18e243e2c05841314c5e9c06a80c70d/vllm/v1/attention/backends/cpu_attn.py#L22-L121>
+
+- `[UP-CUDA-KV-SHAPE]` CUDA kernel-level KV and block-table argument layout
+  - <https://github.com/vllm-project/vllm/blob/1892993bc18e243e2c05841314c5e9c06a80c70d/csrc/attention/attention_kernels.cuh#L83-L114>
+
+- `[UP-CUDA-PAGED-V1]` Paged-attention v1 launch path
+  - <https://github.com/vllm-project/vllm/blob/1892993bc18e243e2c05841314c5e9c06a80c70d/csrc/attention/paged_attention_v1.cu#L44-L103>
+
+- `[UP-CUDA-PAGED-V2]` Paged-attention v2 launch path
+  - <https://github.com/vllm-project/vllm/blob/1892993bc18e243e2c05841314c5e9c06a80c70d/csrc/attention/paged_attention_v2.cu#L36-L123>
+
 ## Upstream vllm-spyre `pr-759` anchors
 
 ### `pr-759` itself
@@ -164,6 +183,41 @@ move.
 - `[OLD-FMS-KV-PATH]` `SpyreCausalLM` owning `past_key_value_states` and passing them through the FMS forward path
   - <https://github.com/vllm-project/vllm-spyre/blob/8a9682897aa2bd4d77cf3fdab7acd3fbfe452a72/vllm_spyre/model_executor/model_loader/spyre.py#L140-L142>
   - <https://github.com/vllm-project/vllm-spyre/blob/8a9682897aa2bd4d77cf3fdab7acd3fbfe452a72/vllm_spyre/model_executor/model_loader/spyre.py#L343-L436>
+
+## Current `vllm-spyre` next-stack scaffold anchors
+
+- `[NEXT-PLATFORM]` `TorchSpyrePlatform` scaffold and explicit placeholder wiring
+  - <https://github.com/toddllm/vllm-spyre/blob/5aeb39ec813ff01161ec8f3a832fc86f676238c8/vllm_spyre_next/vllm_spyre_next/platform.py#L28-L82>
+
+- `[NEXT-EXAMPLE]` next-stack example explicitly using upstream CPU path today
+  - <https://github.com/toddllm/vllm-spyre/blob/5aeb39ec813ff01161ec8f3a832fc86f676238c8/vllm_spyre_next/examples/torch_spyre_inference.py#L1-L104>
+
+## `torch-spyre` runtime/backend anchors
+
+- `[TS-ENTRYPOINT]` `torch.backends` entrypoint registration
+  - <https://github.com/toddllm/torch-spyre/blob/6782329492de7558098ec17cd1260d4aab8d93ad/pyproject.toml#L19-L63>
+
+- `[TS-BACKEND-REGISTER]` PrivateUse1 backend registration and device-module setup
+  - <https://github.com/toddllm/torch-spyre/blob/6782329492de7558098ec17cd1260d4aab8d93ad/torch_spyre/__init__.py#L152-L179>
+
+- `[TS-INDUCTOR-AUTOLOAD]` inductor backend/device registration and patch-heavy integration
+  - <https://github.com/toddllm/torch-spyre/blob/6782329492de7558098ec17cd1260d4aab8d93ad/torch_spyre/_inductor/__init__.py#L23-L111>
+
+- `[TS-FALLBACKS]` eager CPU fallback registration on Spyre device
+  - <https://github.com/toddllm/torch-spyre/blob/6782329492de7558098ec17cd1260d4aab8d93ad/torch_spyre/fallbacks.py#L81-L196>
+
+- `[TS-PRELOAD]` Inductor decomposition exclusions tied to fallback pressure
+  - <https://github.com/toddllm/torch-spyre/blob/6782329492de7558098ec17cd1260d4aab8d93ad/torch_spyre/_inductor/preload.py#L15-L41>
+
+- `[TS-COPY]` copy path comments and current host/device copy implementation
+  - <https://github.com/toddllm/torch-spyre/blob/6782329492de7558098ec17cd1260d4aab8d93ad/torch_spyre/csrc/spyre_mem.cpp#L633-L679>
+
+- `[TS-COPY-FIXME]` current Spyre-to-Spyre copy limitation
+  - <https://github.com/toddllm/torch-spyre/blob/6782329492de7558098ec17cd1260d4aab8d93ad/torch_spyre/csrc/spyre_mem.cpp#L664-L676>
+
+- `[TS-HOOKS-STREAM]` stream/event hooks still stubbed or placeholder
+  - <https://github.com/toddllm/torch-spyre/blob/6782329492de7558098ec17cd1260d4aab8d93ad/torch_spyre/csrc/spyre_hooks.cpp#L117-L206>
+  - <https://github.com/toddllm/torch-spyre/blob/6782329492de7558098ec17cd1260d4aab8d93ad/torch_spyre/csrc/spyre_hooks.cpp#L222-L255>
 
 ## Experimental Spyre connector anchors
 

@@ -613,10 +613,14 @@ decision-oriented narratives for the highest-value integration boundaries.
 - seam index: [seams/README.md](./seams/README.md)
 - scheduler, block manager, and placement:
   [seams/01-scheduler-block-manager.md](./seams/01-scheduler-block-manager.md)
+- attention backend and slot mapping:
+  [seams/02-attention-slot-mapping.md](./seams/02-attention-slot-mapping.md)
 - KV connector lifecycle:
   [seams/03-kv-connector-lifecycle.md](./seams/03-kv-connector-lifecycle.md)
 - old-stack divergences:
   [seams/04-old-stack-divergences.md](./seams/04-old-stack-divergences.md)
+- next-stack and runtime direction:
+  [seams/05-next-stack-and-runtime-direction.md](./seams/05-next-stack-and-runtime-direction.md)
 
 Those pages are intentionally narrative summaries, not replacements for the
 pinned reference appendix in [source-map.md](./source-map.md).
