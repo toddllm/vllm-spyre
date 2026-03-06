@@ -44,6 +44,14 @@ move.
 | Experimental worker-side connector flow | `EXP-CONN-BIND`, `EXP-CONN-LOAD`, `EXP-CONN-SAVE`, `EXP-CONN-FINISH` | Shows binding, load, save, and completion handling. |
 | Failure and recompute fallback | `UP-SCHED-CONN-STEP`, `EXP-BRIDGE-AFTER`, `EXP-CONN-LOADERR`, `EXP-CONN-FINISH` | Shows how load errors surface as invalid block IDs and completion state rather than silent reuse. |
 
+## Seam page mapping
+
+| Seam page | Anchor IDs | Why this supports the page |
+| --- | --- | --- |
+| `seams/01-scheduler-block-manager.md` | `UP-SCHED-INIT`, `UP-SCHED-KVCM-INIT`, `UP-SCHED-SCHEDULE`, `UP-SCHED-KV-META`, `UP-KVCM-ALLOC`, `UP-BT-SLOTMAP`, `UP-ATTN-SLOTMAP`, `UP-SCHED-CONN-STEP`, `OLD-DUMMY-KVSPEC`, `OLD-FMS-KV-PATH` | Shows upstream control-plane ownership of scheduling and placement, plus the old-stack limitation that keeps byte ownership in the FMS path. |
+| `seams/03-kv-connector-lifecycle.md` | `UP-SCHED-KV-META`, `UP-SCHED-CONN-STEP`, `UP-ACTIVE-PRE`, `UP-ACTIVE-POST`, `UP-ACTIVE-NOFWD`, `EXP-BRIDGE-BEGIN`, `EXP-BRIDGE-BEFORE`, `EXP-BRIDGE-AFTER`, `EXP-BRIDGE-FINISH`, `EXP-CONN-BIND`, `EXP-CONN-LOAD`, `EXP-CONN-SAVE`, `EXP-CONN-FINISH`, `EXP-CONN-LOADERR` | Shows the split between scheduler-owned lifecycle, worker-side connector phases, bridge-shaped old-stack adaptation, and explicit failure/recompute fallback. |
+| `seams/04-old-stack-divergences.md` | `UP-SCHED-SCHEDULE`, `UP-SCHED-CONN-STEP`, `OLD-DUMMY-KVSPEC`, `OLD-FMS-KV-PATH`, `EXP-BRIDGE-BEGIN`, `EXP-BRIDGE-BEFORE`, `EXP-BRIDGE-AFTER`, `EXP-BRIDGE-FINISH` | Shows why old `vllm-spyre` remains bridge-shaped around an FMS-owned data plane and which parts are transitional rather than durable. |
+
 ## Upstream vLLM anchors
 
 ### Scheduler and metadata handoff

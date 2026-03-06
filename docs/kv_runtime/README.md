@@ -604,3 +604,19 @@ core model:
   [appendix-conformance.md](./appendix-conformance.md)
 - open assumptions to challenge:
   [appendix-open-assumptions.md](./appendix-open-assumptions.md)
+
+## Related seam pages
+
+The core note gives the durable architecture. The seam pages give shorter,
+decision-oriented narratives for the highest-value integration boundaries.
+
+- seam index: [seams/README.md](./seams/README.md)
+- scheduler, block manager, and placement:
+  [seams/01-scheduler-block-manager.md](./seams/01-scheduler-block-manager.md)
+- KV connector lifecycle:
+  [seams/03-kv-connector-lifecycle.md](./seams/03-kv-connector-lifecycle.md)
+- old-stack divergences:
+  [seams/04-old-stack-divergences.md](./seams/04-old-stack-divergences.md)
+
+Those pages are intentionally narrative summaries, not replacements for the
+pinned reference appendix in [source-map.md](./source-map.md).
