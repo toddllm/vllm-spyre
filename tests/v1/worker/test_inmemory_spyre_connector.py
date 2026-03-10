@@ -374,6 +374,60 @@ class TestIdentityLoadSaveRoundtrip:
 
         connector.clear_connector_metadata()
 
+    def test_identity_load_without_block_mapping_uses_block_ids(self):
+        """No block_mapping should default to source_id -> dest_id identity."""
+        store = InMemoryKVStore()
+        connector = _make_connector(store=store, block_size=2)
+
+        staging = _make_staging_caches(
+            num_layers=1, num_blocks=16, block_size=2,
+            num_kv_heads=1, head_dim=2,
+        )
+        connector.register_kv_caches(staging)
+        layer_name = sorted(staging.keys())[0]
+
+        # Save using a non-zero block ID to catch index-vs-block-ID errors.
+        staging[layer_name][0][10].fill_(7.0)
+        staging[layer_name][1][10].fill_(9.0)
+        save_meta = SpyreConnectorMeta(
+            requests=[
+                SpyreConnectorRequestMeta(
+                    req_id="req-src", block_ids=[10], is_store=True
+                ),
+            ],
+            layer_names=sorted(staging.keys()),
+            block_size=2,
+        )
+        connector.bind_connector_metadata(save_meta)
+        connector.wait_for_save()
+        connector.clear_connector_metadata()
+
+        staging[layer_name].zero_()
+        load_meta = SpyreConnectorMeta(
+            requests=[
+                SpyreConnectorRequestMeta(
+                    req_id="req-dst",
+                    block_ids=[10],
+                    is_store=False,
+                    source_req_id="req-src",
+                ),
+            ],
+            layer_names=sorted(staging.keys()),
+            block_size=2,
+        )
+        connector.bind_connector_metadata(load_meta)
+        connector.start_load_kv(MagicMock())
+
+        assert torch.equal(
+            staging[layer_name][0][10],
+            torch.full((2, 1, 2), 7.0),
+        )
+        assert torch.equal(
+            staging[layer_name][1][10],
+            torch.full((2, 1, 2), 9.0),
+        )
+        assert connector.get_block_ids_with_load_errors() == set()
+
 
 # ---------------------------------------------------------------------------
 # get_finished Safety Tests

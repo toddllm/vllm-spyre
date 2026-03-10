@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     VLLM_SPYRE_REQUIRE_KNOWN_CONFIG: bool = False
     VLLM_SPYRE_MODEL_CONFIG_FILE: str | None = None
     VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE: bool = False
+    VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE: int = 1024
 
 logger = init_logger(__name__)
 
@@ -139,6 +140,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to be configured via --kv-connector. Disabled by default.
     "VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE": lambda: bool(
         int(os.getenv("VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE", "0"))
+    ),
+    # Maximum number of saved requests retained for KV prefix reuse.
+    # When the registry reaches this limit, the oldest entry is evicted
+    # (LRU). Set to 0 for unlimited (not recommended for production).
+    "VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE": lambda: int(
+        os.getenv("VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE", "1024")
     ),
 }
 # --8<-- [end:env-vars-definition]
