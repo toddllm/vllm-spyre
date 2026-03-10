@@ -16,8 +16,9 @@ Key design decisions:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 import torch
@@ -25,13 +26,16 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorStats,
+)
 
 
 # ---------------------------------------------------------------------------
 # Store Key (for in-memory key-value store)
 # ---------------------------------------------------------------------------
 
-class KVKind(str, Enum):
+class KVKind(StrEnum):
     """Discriminator for key vs value tensors.
 
     FMS stores K and V as separate tensors per layer. For Spyre-internal
@@ -206,6 +210,88 @@ class SpyreConnectorMeta(KVConnectorMetadata):
                 )
             seen.add(block_id)
 
+    # Supported schema versions for forward compatibility.
+    _SUPPORTED_VERSIONS: frozenset[int] = frozenset({1})
+
+    # Known layout values.
+    _KNOWN_LAYOUTS: frozenset[str] = frozenset({"NHD"})
+
+    def validate(self) -> None:
+        """Strict validation of metadata fields.
+
+        Checks:
+          - schema_version is supported
+          - layout is a known value
+          - dimensional fields are non-negative
+          - per-request: req_id non-empty, block_ids non-negative,
+            block_mapping bounds, load-needs-source consistency
+          - block mapping duplicate check
+
+        Raises:
+            ValueError: If any field is invalid or unsupported.
+        """
+        if self.schema_version not in self._SUPPORTED_VERSIONS:
+            raise ValueError(
+                f"Unsupported schema_version {self.schema_version}. "
+                f"Supported: {sorted(self._SUPPORTED_VERSIONS)}"
+            )
+
+        if self.layout and self.layout not in self._KNOWN_LAYOUTS:
+            raise ValueError(
+                f"Unknown layout '{self.layout}'. "
+                f"Known: {sorted(self._KNOWN_LAYOUTS)}"
+            )
+
+        # Validate per-request metadata.
+        for req in self.requests:
+            if not req.req_id:
+                raise ValueError("Request with empty req_id in metadata")
+            if not req.is_store and not req.source_req_id and req.block_mapping:
+                raise ValueError(
+                    f"Load request {req.req_id} has block_mapping but "
+                    f"no source_req_id"
+                )
+            # Block ID sanity: all block_ids must be non-negative.
+            for bid in req.block_ids:
+                if bid < 0:
+                    raise ValueError(
+                        f"Request {req.req_id} has negative block_id {bid}"
+                    )
+            # Block mapping bounds: all source and dest must be non-negative.
+            for src, dest in req.block_mapping:
+                if src < 0:
+                    raise ValueError(
+                        f"Request {req.req_id} block_mapping has "
+                        f"negative source block_id {src}"
+                    )
+                if dest < 0:
+                    raise ValueError(
+                        f"Request {req.req_id} block_mapping has "
+                        f"negative dest block_id {dest}"
+                    )
+
+        # Dimensional fields: reject only clearly invalid negative values.
+        # block_size=0 is allowed (informational; connector reads from config).
+        if self.num_layers < 0:
+            raise ValueError(
+                f"num_layers must be >= 0, got {self.num_layers}"
+            )
+        if self.num_kv_heads < 0:
+            raise ValueError(
+                f"num_kv_heads must be >= 0, got {self.num_kv_heads}"
+            )
+        if self.head_dim < 0:
+            raise ValueError(
+                f"head_dim must be >= 0, got {self.head_dim}"
+            )
+        if self.block_size < 0:
+            raise ValueError(
+                f"block_size must be >= 0, got {self.block_size}"
+            )
+
+        # Block mapping duplicate check (defers to existing method).
+        self.validate_block_mapping()
+
     @staticmethod
     def make_layer_names(num_layers: int) -> list[str]:
         """Generate vLLM-convention layer names."""
@@ -217,19 +303,42 @@ class SpyreConnectorMeta(KVConnectorMetadata):
 # ---------------------------------------------------------------------------
 
 class InMemoryKVStore:
-    """Dictionary-backed KV store with metrics tracking.
+    """Dictionary-backed KV store with optional byte-cap LRU eviction.
+
+    When ``max_bytes`` > 0, entries are evicted in insertion order (oldest
+    first) when total memory usage would exceed the cap. Insertion order
+    is maintained via a Python ``dict`` (guaranteed ordered since 3.7).
 
     Injectable: tests can create a fresh store and pass it to the connector.
     NOT thread-safe (Spyre uses single-worker model).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_bytes: int = 0) -> None:
         self._store: dict[StoreKey, InMemoryKVEntry] = {}
         self._version_counter: int = 0
+        self._max_bytes: int = max(0, max_bytes)
+        self._current_bytes: int = 0
+        self._evictions: int = 0
 
     @property
     def size(self) -> int:
         return len(self._store)
+
+    @property
+    def current_bytes(self) -> int:
+        return self._current_bytes
+
+    @property
+    def max_bytes(self) -> int:
+        return self._max_bytes
+
+    @property
+    def evictions(self) -> int:
+        return self._evictions
+
+    @staticmethod
+    def _entry_bytes(entry: InMemoryKVEntry) -> int:
+        return entry.data.nelement() * entry.data.element_size()
 
     def put(
         self,
@@ -242,14 +351,41 @@ class InMemoryKVStore:
         version = self._version_counter
         was_overwrite = key in self._store
 
-        self._store[key] = InMemoryKVEntry(
+        # If overwriting, subtract the old entry's size first.
+        if was_overwrite:
+            old = self._store[key]
+            self._current_bytes -= self._entry_bytes(old)
+
+        entry = InMemoryKVEntry(
             data=data.detach().clone().cpu(),
             dtype=str(data.dtype),
             shape=tuple(data.shape),
             version=version,
             source_req=source_req,
         )
+        entry_size = self._entry_bytes(entry)
+
+        # Evict oldest entries if adding this would exceed the byte cap.
+        if self._max_bytes > 0:
+            while (
+                self._store
+                and self._current_bytes + entry_size > self._max_bytes
+            ):
+                self._evict_oldest()
+
+        self._store[key] = entry
+        self._current_bytes += entry_size
         return version, was_overwrite
+
+    def _evict_oldest(self) -> StoreKey | None:
+        """Remove the oldest entry (first in insertion order)."""
+        if not self._store:
+            return None
+        oldest_key = next(iter(self._store))
+        oldest_entry = self._store.pop(oldest_key)
+        self._current_bytes -= self._entry_bytes(oldest_entry)
+        self._evictions += 1
+        return oldest_key
 
     def get(self, key: StoreKey) -> InMemoryKVEntry | None:
         return self._store.get(key)
@@ -261,12 +397,14 @@ class InMemoryKVStore:
         """Remove all entries for a request ID. Returns count removed."""
         keys = [k for k in self._store if k.req_id == req_id]
         for k in keys:
-            del self._store[k]
+            entry = self._store.pop(k)
+            self._current_bytes -= self._entry_bytes(entry)
         return len(keys)
 
     def clear(self) -> None:
         self._store.clear()
         self._version_counter = 0
+        self._current_bytes = 0
 
     def stats(self) -> dict[str, Any]:
         req_ids = {k.req_id for k in self._store}
@@ -274,8 +412,110 @@ class InMemoryKVStore:
             "total_entries": len(self._store),
             "unique_requests": len(req_ids),
             "version_counter": self._version_counter,
-            "memory_estimate_bytes": sum(
-                e.data.nelement() * e.data.element_size()
-                for e in self._store.values()
-            ),
+            "memory_estimate_bytes": self._current_bytes,
+            "max_bytes": self._max_bytes,
+            "evictions": self._evictions,
         }
+
+    def export_to_dir(self, path: str) -> int:
+        """Serialize all entries to a directory for cross-process transport.
+
+        Each entry is stored as a .pt file with the tensor and metadata.
+        Returns the number of entries exported.
+        """
+        os.makedirs(path, exist_ok=True)
+        count = 0
+        for key, entry in self._store.items():
+            fname = (
+                f"{key.req_id}__L{key.layer_idx}__B{key.block_id}"
+                f"__{key.kv_kind}.pt"
+            )
+            payload = {
+                "data": entry.data,
+                "dtype": entry.dtype,
+                "shape": entry.shape,
+                "version": entry.version,
+                "source_req": entry.source_req,
+                "key_req_id": key.req_id,
+                "key_layer_idx": key.layer_idx,
+                "key_block_id": key.block_id,
+                "key_kv_kind": str(key.kv_kind),
+            }
+            torch.save(payload, os.path.join(path, fname))
+            count += 1
+        return count
+
+    def import_from_dir(self, path: str) -> int:
+        """Deserialize entries from a directory into this store.
+
+        Returns the number of entries imported.
+        """
+        count = 0
+        for fname in os.listdir(path):
+            if not fname.endswith(".pt"):
+                continue
+            payload = torch.load(
+                os.path.join(path, fname), weights_only=False,
+            )
+            key = StoreKey(
+                req_id=payload["key_req_id"],
+                layer_idx=payload["key_layer_idx"],
+                block_id=payload["key_block_id"],
+                kv_kind=KVKind(payload["key_kv_kind"]),
+            )
+            self._version_counter += 1
+            self._store[key] = InMemoryKVEntry(
+                data=payload["data"],
+                dtype=payload["dtype"],
+                shape=payload["shape"],
+                version=self._version_counter,
+                source_req=payload["source_req"],
+            )
+            count += 1
+        return count
+
+
+# ---------------------------------------------------------------------------
+# Connector Stats (upstream KVConnectorStats subclass)
+# ---------------------------------------------------------------------------
+
+_STATS_KEYS = (
+    "matched_tokens",
+    "loaded_blocks",
+    "saved_blocks",
+    "load_misses",
+    "evictions",
+    "match_attempts",
+)
+
+
+@dataclass
+class SpyreConnectorStats(KVConnectorStats):
+    """Per-interval telemetry for the InMemorySpyreConnector.
+
+    Each counter accumulates observations during a logging interval.
+    reset() zeroes the counters for the next interval.
+    """
+
+    def __post_init__(self):
+        if not self.data:
+            self.reset()
+
+    def reset(self):
+        self.data = {k: 0 for k in _STATS_KEYS}
+
+    def record(self, key: str, value: int = 1) -> None:
+        self.data[key] = self.data.get(key, 0) + value
+
+    def aggregate(
+        self, other: KVConnectorStats
+    ) -> SpyreConnectorStats:
+        for k in _STATS_KEYS:
+            self.data[k] = self.data.get(k, 0) + other.data.get(k, 0)
+        return self
+
+    def reduce(self) -> dict[str, int | float]:
+        return {k: self.data.get(k, 0) for k in _STATS_KEYS}
+
+    def is_empty(self) -> bool:
+        return all(self.data.get(k, 0) == 0 for k in _STATS_KEYS)

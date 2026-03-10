@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     VLLM_SPYRE_MODEL_CONFIG_FILE: str | None = None
     VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE: bool = False
     VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE: int = 1024
+    VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS: int = 0
+    VLLM_SPYRE_KV_STORE_MAX_BYTES: int = 0
 
 logger = init_logger(__name__)
 
@@ -146,6 +148,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (LRU). Set to 0 for unlimited (not recommended for production).
     "VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE": lambda: int(
         os.getenv("VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE", "1024")
+    ),
+    # Number of worker threads for async per-layer KV load in the connector.
+    # When > 0, start_load_kv submits per-layer loads to a ThreadPoolExecutor
+    # and wait_for_layer_load blocks on individual futures. When 0 (default),
+    # loads are synchronous. This is separate from VLLM_SPYRE_MAX_LOAD_PROCESSES
+    # which controls concurrent model compilation/loading processes.
+    "VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS": lambda: int(
+        os.getenv("VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS", "0")
+    ),
+    # Maximum total bytes for the in-memory KV store. When > 0, the store
+    # evicts the oldest entries (LRU) when total memory exceeds this limit.
+    # Set to 0 for unlimited (count-based eviction only via registry cap).
+    "VLLM_SPYRE_KV_STORE_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_SPYRE_KV_STORE_MAX_BYTES", "0")
     ),
 }
 # --8<-- [end:env-vars-definition]
