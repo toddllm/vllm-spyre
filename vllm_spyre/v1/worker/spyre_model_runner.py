@@ -748,8 +748,9 @@ class ChunkedPrefillModelRunner(
 
         self._kv_bridge = maybe_create_bridge(vllm_config)
         # Optional KV connector staging buffers keyed by layer name.
-        # These are populated by the worker once warmup has finalized the
-        # FMS past_key_value_states allocation.
+        # These use separate storage from the FMS past_key_value_states
+        # tensors and are populated by the worker once warmup has finalized
+        # the FMS allocation.
         self._connector_kv_staging: dict[str, torch.Tensor] | None = None
         self._connector_kv_pairs: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None
 
@@ -766,16 +767,26 @@ class ChunkedPrefillModelRunner(
     ) -> None:
         """Attach connector KV staging tensors and FMS K/V tensor pairs.
 
+        The staging tensors are separate connector-facing buffers, not
+        aliases of the underlying FMS past_key_value_states tensors.
+        The FMS K/V tensors remain the live execution state for model
+        forward; the connector reads and writes the separate staging
+        buffers. Synchronization between the two is done explicitly around
+        each bridge-managed step.
+
+        This intentionally duplicates KV storage at the staging boundary
+        for the current design point in the current Spyre software stack.
+
         Args:
             kv_staging: Layer-name keyed tensors with shape [2, ...], used by
-                KV connectors.
+                KV connectors as staging buffers with separate storage.
             kv_pairs: Layer-name keyed (K, V) tensors used by FMS execution.
         """
         self._connector_kv_staging = kv_staging
         self._connector_kv_pairs = kv_pairs
 
     def _sync_loaded_kv_from_staging(self) -> None:
-        """Copy connector-loaded staging KV into FMS K/V tensors."""
+        """Copy connector-loaded staging KV into the live FMS K/V tensors."""
         if self._connector_kv_staging is None or self._connector_kv_pairs is None:
             return
 
@@ -788,7 +799,7 @@ class ChunkedPrefillModelRunner(
             v_cache.copy_(kv_tensor[1])
 
     def _sync_fms_kv_to_staging(self) -> None:
-        """Copy current FMS K/V tensors into connector staging tensors."""
+        """Copy the current live FMS K/V tensors back into staging buffers."""
         if self._connector_kv_staging is None or self._connector_kv_pairs is None:
             return
 
@@ -1663,9 +1674,9 @@ class ChunkedPrefillModelRunner(
                 # forward context so start_load_kv has valid context)
                 if bridge_active:
                     self._kv_bridge.before_forward(scheduler_output)
-                    # start_load_kv writes into connector staging buffers.
-                    # Propagate any loaded values into FMS K/V tensors before
-                    # forward executes.
+                    # start_load_kv writes into separate connector staging
+                    # buffers. Copy any loaded values into the live FMS K/V
+                    # tensors before forward executes.
                     self._sync_loaded_kv_from_staging()
 
                 logits = self.model(
@@ -1677,9 +1688,10 @@ class ChunkedPrefillModelRunner(
 
             # Connector: collect results after forward
             if bridge_active:
-                # FMS forward updates K/V through separate tensors. Mirror
-                # those updates into connector staging buffers before
-                # post-forward connector calls (save/wait/finished).
+                # FMS forward updates the live K/V tensors, not the separate
+                # connector staging buffers. Copy those updates back into
+                # staging before post-forward connector calls
+                # (save/wait/finished).
                 self._sync_fms_kv_to_staging()
                 self._kv_bridge.after_forward(scheduler_output)
 

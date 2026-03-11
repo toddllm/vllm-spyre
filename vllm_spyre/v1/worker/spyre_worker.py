@@ -297,10 +297,13 @@ class SpyreWorker(WorkerBase):
             # Use a connector-facing vLLM-style key here rather than an
             # FMS-native layer path. This key is synthetic and index-based.
             layer_name = _connector_layer_name(layer_idx)
-            # Build a connector-facing [2, ...] staging tensor and keep the
-            # original FMS K/V tensors for explicit synchronization in the
-            # model runner. `torch.stack` allocates new storage, so we cannot
-            # rely on aliasing.
+            # Build a connector-facing [2, ...] staging tensor with separate
+            # storage and keep the original FMS K/V tensors for explicit
+            # synchronization in the model runner. `torch.stack` allocates
+            # new storage, so these staging tensors are not aliases of
+            # past_key_value_states.
+            # This is the intentional duplication point between live FMS
+            # state and connector I/O staging.
             kv_caches_dict[layer_name] = torch.stack([k_cache, v_cache])
             kv_cache_pairs[layer_name] = (k_cache, v_cache)
 
