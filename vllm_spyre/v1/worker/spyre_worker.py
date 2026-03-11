@@ -54,6 +54,16 @@ logger = init_logger(__name__)
 _inside_warmup_mode = False
 
 
+def _connector_layer_name(layer_idx: int) -> str:
+    """Return the connector-facing layer key for a KV cache layer.
+
+    This is a synthetic connector-facing key that uses the current vLLM
+    naming convention for connector metadata and staging keys. It is
+    derived from layer index, not discovered from the underlying FMS model.
+    """
+    return f"model.layers.{layer_idx}.self_attn"
+
+
 def new_request_data_builder(
     req_id: str,
     block_ids: tuple[list[int]],
@@ -284,7 +294,9 @@ class SpyreWorker(WorkerBase):
         kv_caches_dict: dict[str, torch.Tensor] = {}
         kv_cache_pairs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         for layer_idx, (k_cache, v_cache) in enumerate(kv_caches):
-            layer_name = f"model.layers.{layer_idx}.self_attn"
+            # Use a connector-facing vLLM-style key here rather than an
+            # FMS-native layer path. This key is synthetic and index-based.
+            layer_name = _connector_layer_name(layer_idx)
             # Build a connector-facing [2, ...] staging tensor and keep the
             # original FMS K/V tensors for explicit synchronization in the
             # model runner. `torch.stack` allocates new storage, so we cannot
