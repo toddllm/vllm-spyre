@@ -242,6 +242,11 @@ class SpyreWorker(WorkerBase):
     def _register_connector_kv_caches(self) -> None:
         """Register KV caches with the connector after final warmup allocation.
 
+        This is a workaround for the current design point in the current
+        Spyre software stack. It depends on visibility of FMS-managed
+        past_key_value_states after warmup finalizes their allocation, and
+        is not the vllm-spyre-next or compile-native registration path.
+
         Must be called after complete_warmup() since warmup reallocates
         past_key_value_states tensors. Any earlier registration captures
         stale references.
@@ -265,9 +270,10 @@ class SpyreWorker(WorkerBase):
             )
             return
 
-        # Build kv_caches_dict from FMS past_key_value_states.
-        # FMS stores List[Tuple[K_tensor, V_tensor]] per layer.
-        # We pass them keyed by upstream layer naming convention.
+        # In the current design point, connector registration is rebuilt
+        # from FMS-managed past_key_value_states after warmup rather than
+        # coming from a compile-native attention/backend path.
+        # FMS stores these as List[Tuple[K_tensor, V_tensor]] per layer.
         kv_caches = getattr(self.model_runner.model, "past_key_value_states", None)
         if kv_caches is None:
             logger.warning(
