@@ -237,8 +237,12 @@ def maybe_create_bridge(
     vllm_config: "VllmConfig",
 ) -> SpyreKVConnectorBridge | None:
     """
-    Create a SpyreKVConnectorBridge if the feature flag is enabled
-    and KV transfer is configured.
+    Create the worker-side SpyreKVConnectorBridge if the feature flag is
+    enabled and this process is configured for KV transfer.
+
+    This only enables worker lifecycle wiring. The bridge still remains
+    inactive on any given step unless the scheduler emits
+    kv_connector_metadata for that step.
 
     Returns None if disabled or not configured.
     """
