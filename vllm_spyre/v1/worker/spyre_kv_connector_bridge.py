@@ -250,7 +250,9 @@ def maybe_create_bridge(
 
     This only enables worker lifecycle wiring. The bridge still remains
     inactive on any given step unless the scheduler emits
-    kv_connector_metadata for that step.
+    kv_connector_metadata for that step. This is an experimental worker-side
+    gate for the current design point; future cleanup may consolidate
+    activation under a simpler control surface.
 
     Returns None if disabled or not configured.
     """

@@ -138,7 +138,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # finish phases around the FMS forward pass on the worker. This does
     # not by itself activate end-to-end KV transfer: the worker must also
     # be configured as a KV transfer instance, and the scheduler must emit
-    # kv_connector_metadata for the step. Disabled by default.
+    # kv_connector_metadata for the step. This is an experimental worker-side
+    # gate for the current design point; future cleanup may consolidate
+    # activation under a simpler control surface. Disabled by default.
     "VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE": lambda: bool(
         int(os.getenv("VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE", "0"))
     ),
