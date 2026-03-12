@@ -19,6 +19,11 @@ import vllm.envs as envs
 from huggingface_hub import hf_hub_download
 from vllm.config import VllmConfig
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    ensure_kv_transfer_shutdown,
+    has_kv_transfer_group,
+)
 from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -47,6 +52,16 @@ logger = init_logger(__name__)
 
 # var to make sure we always warmup with the right context
 _inside_warmup_mode = False
+
+
+def _connector_layer_name(layer_idx: int) -> str:
+    """Return the connector-facing layer key for a KV cache layer.
+
+    This is a synthetic connector-facing key that uses the current vLLM
+    naming convention for connector metadata and staging keys. It is
+    derived from layer index, not discovered from the underlying FMS model.
+    """
+    return f"model.layers.{layer_idx}.self_attn"
 
 
 def new_request_data_builder(
@@ -164,6 +179,7 @@ class SpyreWorker(WorkerBase):
             self._warmup_spyre_fixed_size(prompt_len, self.restricted_tokens, batch_size)
 
         self.model_runner.complete_warmup()
+        self._register_connector_kv_caches()
 
         all_warmup_end_t = time.time()
         all_warmup_total_t = all_warmup_end_t - all_warmup_start_t
@@ -180,6 +196,10 @@ class SpyreWorker(WorkerBase):
         """Basic health check (override for device-specific checks)."""
         # TODO: Implement something!
         return
+
+    def shutdown(self) -> None:
+        """Clean up KV transfer resources on worker shutdown."""
+        ensure_kv_transfer_shutdown()
 
     def determine_available_memory(self) -> int:
         """Return available device memory in bytes.
@@ -220,7 +240,84 @@ class SpyreWorker(WorkerBase):
     def initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None:
         """Construct the KV cache from the provided configs.
         Currently, we do not support paged attention or kv caching"""
-        pass
+        # Initialize KV connector if configured. The connector may need
+        # kv_cache_config, so this runs after cache config is available.
+        if kv_cache_configs:
+            ensure_kv_transfer_initialized(
+                self.vllm_config, kv_cache_config=kv_cache_configs[0]
+            )
+        else:
+            ensure_kv_transfer_initialized(self.vllm_config)
+
+    def _register_connector_kv_caches(self) -> None:
+        """Register KV caches with the connector after final warmup allocation.
+
+        This is a workaround for the current design point in the current
+        Spyre software stack. It depends on visibility of FMS-managed
+        past_key_value_states after warmup finalizes their allocation, and
+        is not the vllm-spyre-next or compile-native registration path.
+
+        Must be called after complete_warmup() since warmup reallocates
+        past_key_value_states tensors. Any earlier registration captures
+        stale references.
+        """
+        if not has_kv_transfer_group():
+            return
+
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            KVConnectorBase_V1,
+        )
+        from vllm.distributed.kv_transfer import get_kv_transfer_group
+
+        connector = get_kv_transfer_group()
+        if not isinstance(connector, KVConnectorBase_V1):
+            return
+
+        if not isinstance(self.model_runner, ChunkedPrefillModelRunner):
+            logger.debug(
+                "KV cache registration skipped: model runner is not "
+                "ChunkedPrefillModelRunner."
+            )
+            return
+
+        # In the current design point, connector registration is rebuilt
+        # from FMS-managed past_key_value_states after warmup rather than
+        # coming from a compile-native attention/backend path.
+        # FMS stores these as List[Tuple[K_tensor, V_tensor]] per layer.
+        kv_caches = getattr(self.model_runner.model, "past_key_value_states", None)
+        if kv_caches is None:
+            logger.warning(
+                "Cannot register KV caches: past_key_value_states is None."
+            )
+            return
+
+        kv_caches_dict: dict[str, torch.Tensor] = {}
+        kv_cache_pairs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        for layer_idx, (k_cache, v_cache) in enumerate(kv_caches):
+            # Use a connector-facing vLLM-style key here rather than an
+            # FMS-native layer path. This key is synthetic and index-based.
+            layer_name = _connector_layer_name(layer_idx)
+            # Build a connector-facing [2, ...] staging tensor with separate
+            # storage and keep the original FMS K/V tensors for explicit
+            # synchronization in the model runner. `torch.stack` allocates
+            # new storage, so these staging tensors are not aliases of
+            # past_key_value_states.
+            # This is the intentional duplication point between live FMS
+            # state and connector I/O staging.
+            kv_caches_dict[layer_name] = torch.stack([k_cache, v_cache])
+            kv_cache_pairs[layer_name] = (k_cache, v_cache)
+
+        # The model runner uses these maps to synchronize connector staging
+        # tensors <-> FMS K/V tensors around each bridge-managed step.
+        self.model_runner.set_connector_kv_cache_staging(
+            kv_staging=kv_caches_dict,
+            kv_pairs=kv_cache_pairs,
+        )
+
+        connector.register_kv_caches(kv_caches_dict)
+        logger.info(
+            "Registered %d KV cache layers with connector.", len(kv_caches_dict)
+        )
 
     def __init__(
         self,
@@ -529,6 +626,7 @@ class SpyreWorker(WorkerBase):
         self._cleanup_model_runner(request=[deploy_req])
 
         model_runner.complete_warmup()
+        self._register_connector_kv_caches()
 
         warmup_end_t = time.time()
         warmup_total_t = warmup_end_t - warmup_start_t
