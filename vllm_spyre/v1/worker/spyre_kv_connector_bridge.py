@@ -64,17 +64,13 @@ class SpyreKVConnectorBridge:
         self._active = False
         self._output: KVConnectorOutput | None = None
 
-        # Best-effort initial acquisition at bridge construction time.
-        # The connector may not be initialized yet depending on worker
-        # lifecycle ordering; later begin_step() calls retry acquisition
-        # via is_available while _kv_connector is still None.
-        self._try_acquire_connector()
+        # Connector acquisition is done lazily at begin_step().
 
     def _try_acquire_connector(self) -> bool:
-        """Best-effort acquisition of the global KV connector.
+        """Acquire the global KV connector lazily at step time.
 
-        Called once from __init__ and retried lazily by is_available on
-        later steps until a valid connector becomes available.
+        The first successful acquisition is cached in _kv_connector and
+        reused on later steps.
         """
         if self._kv_connector is not None:
             return True
@@ -102,11 +98,6 @@ class SpyreKVConnectorBridge:
         )
         return True
 
-    @property
-    def is_available(self) -> bool:
-        """True if the bridge has or can now acquire a valid connector."""
-        return self._kv_connector is not None or self._try_acquire_connector()
-
     def begin_step(
         self,
         scheduler_output: "SchedulerOutput",
@@ -121,9 +112,9 @@ class SpyreKVConnectorBridge:
         self._active = False
         self._output = None
 
-        # Retry lazy connector acquisition on each step until the global
-        # KV connector becomes available.
-        if not self.is_available:
+        # Acquire the connector lazily at step time. This is the only
+        # acquisition point for the bridge.
+        if not self._try_acquire_connector():
             return False
 
         assert self._kv_connector is not None
