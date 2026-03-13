@@ -19,6 +19,7 @@ import time
 from typing import Any
 
 from spyre_kv_reuse_common import (
+    build_run_metadata,
     build_prompt,
     common_prefix_len,
     diff_counts,
@@ -242,6 +243,7 @@ def main() -> int:
                     _validate_run(run, expect_load=True, expect_save=False, label=run["label"])
 
         summary = {
+            "run_metadata": build_run_metadata(__file__),
             "model": args.model,
             "revision": args.revision,
             "backend": args.backend,

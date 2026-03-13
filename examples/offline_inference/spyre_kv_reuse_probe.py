@@ -16,6 +16,7 @@ import os
 from typing import Any
 
 from spyre_kv_reuse_common import (
+    build_run_metadata,
     build_prompt,
     common_prefix_len,
     diff_counts,
@@ -124,6 +125,7 @@ def main() -> int:
         partial = _run_once(llm, prompt_partial, sampling_params, "partial_reuse")
 
         summary = {
+            "run_metadata": build_run_metadata(__file__),
             "model": args.model,
             "revision": args.revision,
             "backend": args.backend,

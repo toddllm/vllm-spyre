@@ -4,10 +4,25 @@ Shared helpers for single-process Spyre KV reuse probes and benchmarks.
 
 from __future__ import annotations
 
+import datetime
 import os
 import socket
+import subprocess
+import sys
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
+
+
+BASELINE_ENV_VARS = (
+    "HF_HUB_OFFLINE",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "SPYRE_DEVICES",
+    "VLLM_ENABLE_V1_MULTIPROCESSING",
+    "VLLM_SPYRE_DYNAMO_BACKEND",
+    "VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE",
+)
 
 
 def set_local_dist_defaults() -> None:
@@ -18,6 +33,54 @@ def set_local_dist_defaults() -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         os.environ["MASTER_PORT"] = str(sock.getsockname()[1])
+
+
+def _git_output(start_dir: Path, *args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(start_dir), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+
+    value = result.stdout.strip()
+    return value or None
+
+
+def build_run_metadata(script_path: str, argv: list[str] | None = None) -> dict[str, Any]:
+    script = Path(script_path).resolve()
+    git_root = _git_output(script.parent, "rev-parse", "--show-toplevel")
+    git_branch = _git_output(script.parent, "symbolic-ref", "--short", "HEAD")
+    git_commit = _git_output(script.parent, "rev-parse", "HEAD")
+
+    git_info: dict[str, str] = {}
+    if git_root is not None:
+        git_info["root"] = git_root
+    if git_branch is not None:
+        git_info["branch"] = git_branch
+    if git_commit is not None:
+        git_info["commit"] = git_commit
+
+    return {
+        "artifact_format_version": 1,
+        "timestamp_utc": datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat().replace("+00:00", "Z"),
+        "hostname": socket.gethostname(),
+        "cwd": os.getcwd(),
+        "script": str(script),
+        "argv": list(argv or sys.argv),
+        "python_version": sys.version.split()[0],
+        "git": git_info,
+        "env": {
+            key: os.environ[key]
+            for key in BASELINE_ENV_VARS
+            if key in os.environ
+        },
+    }
 
 
 def build_prompt(tokenizer, min_tokens: int, tail: str) -> str:
