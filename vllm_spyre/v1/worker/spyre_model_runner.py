@@ -1569,7 +1569,7 @@ class ChunkedPrefillModelRunner(
             _finalize_bridge()
             return self.get_empty_output()
 
-        model_output = self.sampled_output(output, is_prefill)
+        model_output = self.sampled_output(output, is_prefill, req_ids)
         if bridge_active:
             model_output.kv_connector_output = _finalize_bridge()
         return model_output
@@ -1593,15 +1593,20 @@ class ChunkedPrefillModelRunner(
             prefix_cache_hit_len=self.get_prefix_cache_len(),
         )
 
-    def sampled_output(self, output: SamplerOutput, is_prefill: bool) -> SpyreModelRunnerOutput:
-        req_id_to_index = self.get_req_id_to_index(is_prefill)
+    def sampled_output(
+        self,
+        output: SamplerOutput,
+        is_prefill: bool,
+        req_ids: list[str],
+    ) -> SpyreModelRunnerOutput:
+        req_id_to_index = {req_id: i for i, req_id in enumerate(req_ids)}
         left_padding = {
             req_id: self.requests[req_id].padding_blocks * self.block_size
             for req_id in req_id_to_index
         }
 
         return SpyreModelRunnerOutput(
-            req_ids=list(req_id_to_index.keys()),
+            req_ids=list(req_ids),
             req_id_to_index=req_id_to_index,
             sampled_token_ids=output.sampled_token_ids.tolist(),
             logprobs=(output.logprobs_tensors.tolists() if output.logprobs_tensors else None),
