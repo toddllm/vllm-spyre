@@ -1,5 +1,6 @@
 import importlib.metadata
 import json
+import logging
 from logging.config import dictConfig
 from typing import Any
 
@@ -7,11 +8,49 @@ from vllm.envs import VLLM_CONFIGURE_LOGGING, VLLM_LOGGING_CONFIG_PATH
 from vllm.logger import DEFAULT_LOGGING_CONFIG
 
 __version__ = importlib.metadata.version("vllm_spyre")
+logger = logging.getLogger(__name__)
+
+
+_connector_registered = False
 
 
 def register():
-    """Register the Spyre platform."""
+    """Register the Spyre platform and KV connector."""
+    from vllm_spyre.compat import check_vllm_version
+
+    check_vllm_version()
+    _register_kv_connector()
     return "vllm_spyre.platform.SpyrePlatform"
+
+
+def _register_kv_connector() -> None:
+    """Idempotent registration of the InMemorySpyreConnector with the factory."""
+    global _connector_registered
+    if _connector_registered:
+        return
+
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+
+        KVConnectorFactory.register_connector(
+            "InMemorySpyreConnector",
+            "vllm_spyre.distributed.kv_transfer.kv_connector.v1."
+            "inmemory_spyre_connector",
+            "InMemorySpyreConnector",
+        )
+        _connector_registered = True
+    except ValueError:
+        # Already registered (e.g. register() called twice) — harmless
+        _connector_registered = True
+    except (ImportError, ModuleNotFoundError, AttributeError) as exc:
+        # During early vLLM import, connector modules might not be importable yet.
+        # Do not block platform plugin activation; retry on a later register() call.
+        logger.debug(
+            "Deferring InMemorySpyreConnector registration until later: %s",
+            exc,
+        )
 
 
 def _init_logging():
