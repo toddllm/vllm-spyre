@@ -22,8 +22,10 @@ from vllm.distributed import ensure_model_parallel_initialized, init_distributed
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
     ensure_kv_transfer_shutdown,
+    get_kv_transfer_group,
     has_kv_transfer_group,
 )
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
@@ -141,6 +143,18 @@ class SpyreWorker(WorkerBase):
             SpyreWorker.determine_available_memory
         """
         return self.model_runner.get_kv_cache_spec()
+
+    def get_kv_connector_handshake_metadata(self) -> dict | None:
+        """Get KV connector handshake metadata from this worker if available."""
+        if not has_kv_transfer_group():
+            return None
+
+        connector = get_kv_transfer_group()
+        if (metadata := connector.get_handshake_metadata()) is None:
+            return None
+
+        tp_rank = get_tp_group().rank_in_group
+        return {tp_rank: metadata}
 
     def compile_or_warm_up_model(self) -> float:
         """Prepare model for execution through compilation/warmup.
