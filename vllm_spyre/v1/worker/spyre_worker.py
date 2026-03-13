@@ -231,13 +231,17 @@ class SpyreWorker(WorkerBase):
         # This can probably be fixed in a nicer way.
         return 2 * accurate_fake_kv_cache_size
 
-    def initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None:
-        """Construct the KV cache from the provided configs.
-        Currently, we do not support paged attention or kv caching"""
-        if kv_cache_configs:
-            ensure_kv_transfer_initialized(
-                self.vllm_config, kv_cache_config=kv_cache_configs[0]
-            )
+    def initialize_from_config(
+        self, kv_cache_config: KVCacheConfig | list[KVCacheConfig]
+    ) -> None:
+        """Initialize KV transfer state from either worker-style config shape."""
+        if isinstance(kv_cache_config, list):
+            config = kv_cache_config[0] if kv_cache_config else None
+        else:
+            config = kv_cache_config
+
+        if config is not None:
+            ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config=config)
         else:
             ensure_kv_transfer_initialized(self.vllm_config)
 
