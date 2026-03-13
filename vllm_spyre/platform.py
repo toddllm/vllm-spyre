@@ -414,10 +414,19 @@ class SpyrePlatform(Platform):
     @classmethod
     def validate_request(
         cls,
-        processed_inputs: "ProcessorInputs",
-        params: "SamplingParams | PoolingParams",
+        prompt: object | None = None,
+        params: "SamplingParams | PoolingParams | None" = None,
+        processed_inputs: "ProcessorInputs | None" = None,
     ) -> None:
         """Raises if this request is unsupported on this platform"""
+
+        # vLLM 0.16 calls this as validate_request(prompt=..., params=...,
+        # processed_inputs=...), but older local tests still use the previous
+        # two-argument form validate_request(processed_inputs, params).
+        if processed_inputs is None:
+            if prompt is None:
+                raise TypeError("processed_inputs must be provided")
+            processed_inputs = cast("ProcessorInputs", prompt)
 
         # The PoolingParams import is lazy here because it imports vllm.config,
         # which will in turn import this file again.

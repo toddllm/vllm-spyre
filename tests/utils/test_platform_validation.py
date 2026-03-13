@@ -111,5 +111,20 @@ class TestStructuredOutputValidation:
         # PoolingParams don't have structured_outputs, so just verify no exception
         assert True  # If we got here, the early return worked
 
+    def test_accepts_vllm_v1_keyword_signature(self):
+        """Test compatibility with the current upstream validate_request call."""
+        params = SamplingParams(
+            max_tokens=20, structured_outputs=StructuredOutputsParams(json_object=True)
+        )
+        processed_inputs = token_inputs(prompt_token_ids=[0])
+
+        SpyrePlatform.validate_request(
+            prompt="hello",
+            params=params,
+            processed_inputs=processed_inputs,
+        )
+
+        assert params.structured_outputs is None
+
 
 # Made with Bob
