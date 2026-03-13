@@ -463,5 +463,30 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
     def get_store(self) -> InMemoryKVStore:
         return self._store
 
+    def reset_probe_state(
+        self,
+        *,
+        clear_store: bool = True,
+        clear_saved_requests: bool = True,
+        clear_metrics: bool = True,
+    ) -> None:
+        self._pending_requests.clear()
+        self._pending_load_sources.clear()
+        self._step_stores.clear()
+        self._step_loads.clear()
+        self._load_error_block_ids.clear()
+
+        if clear_saved_requests:
+            self._saved_requests.clear()
+
+        if clear_metrics:
+            self._blocks_saved = 0
+            self._blocks_loaded = 0
+            self._blocks_missing = 0
+            self._stats.reset()
+
+        if clear_store:
+            self._store.clear()
+
     def shutdown(self) -> None:
         logger.info("[InMemorySpyreConnector] Shutdown. Store stats: %s", self._store.stats())

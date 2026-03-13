@@ -282,6 +282,41 @@ class TestInMemorySpyreConnector:
         assert matched == 4
         assert is_async is False
 
+    def test_reset_probe_state_clears_registry_store_and_metrics(self):
+        block_size = 4
+        store = InMemoryKVStore()
+        connector = _make_connector(
+            store=store,
+            role=KVConnectorRole.SCHEDULER,
+            block_size=block_size,
+        )
+
+        req = _make_request("req-A", [10, 20, 30, 40])
+        connector.request_finished(req, [0])
+        connector._blocks_saved = 2
+        connector._blocks_loaded = 3
+        connector._blocks_missing = 1
+        connector._stats.record("matched_tokens", 4)
+        store.put(
+            StoreKey(req_id="req-A", layer_idx=0, block_id=0, kv_kind=KVKind.K),
+            torch.ones((block_size, 1, 2)),
+            source_req="req-A",
+        )
+
+        connector.reset_probe_state()
+
+        assert connector.get_cumulative_metrics() == {
+            "blocks_saved": 0,
+            "blocks_loaded": 0,
+            "blocks_missing": 0,
+            "saved_requests_count": 0,
+        }
+        assert store.stats()["total_entries"] == 0
+        assert connector.get_kv_connector_stats() is None
+
+        matched, _ = connector.get_num_new_matched_tokens(req, 0)
+        assert matched == 0
+
     def test_load_miss_reports_error_blocks(self):
         worker = _make_connector(store=InMemoryKVStore(), role=KVConnectorRole.WORKER, block_size=4)
         staging = _make_staging_caches(

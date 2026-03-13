@@ -13,108 +13,28 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import socket
-from collections.abc import Mapping
 from typing import Any
 
-
-def _set_local_dist_defaults() -> None:
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    if "MASTER_PORT" in os.environ:
-        return
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        os.environ["MASTER_PORT"] = str(sock.getsockname()[1])
-
-
-def _build_prompt(tokenizer, min_tokens: int, tail: str) -> str:
-    shared = (
-        "Spyre KV reuse probe. This prompt is intentionally long so we can "
-        "exercise block-aligned prefix reuse through the connector path. "
-    )
-    prompt = shared
-    while len(tokenizer.encode(prompt)) < min_tokens:
-        prompt += shared
-    return prompt + tail
-
-
-def _common_prefix_len(a: list[int], b: list[int]) -> int:
-    matched = 0
-    for lhs, rhs in zip(a, b):
-        if lhs != rhs:
-            break
-        matched += 1
-    return matched
-
-
-def _get_scheduler_connector(llm):
-    engine_core = llm.llm_engine.engine_core.engine_core
-    scheduler = engine_core.scheduler
-    connector = getattr(scheduler, "connector", None)
-    return connector
-
-
-def _drain_scheduler_stats(llm) -> dict[str, int]:
-    connector = _get_scheduler_connector(llm)
-    if connector is None:
-        return {}
-
-    stats = connector.get_kv_connector_stats()
-    if stats is None:
-        return {}
-
-    if hasattr(stats, "reduce"):
-        reduced = stats.reduce()
-        return {str(k): int(v) for k, v in reduced.items()}
-
-    data = getattr(stats, "data", None)
-    if isinstance(data, Mapping):
-        return {str(k): int(v) for k, v in data.items()}
-
-    return {}
-
-
-def _get_worker_probe_state() -> tuple[dict[str, int], dict[str, Any]]:
-    from vllm.distributed.kv_transfer import (
-        get_kv_transfer_group,
-        has_kv_transfer_group,
-    )
-
-    if not has_kv_transfer_group():
-        return {}, {}
-
-    connector = get_kv_transfer_group()
-
-    cumulative = {}
-    if hasattr(connector, "get_cumulative_metrics"):
-        cumulative = {
-            str(k): int(v)
-            for k, v in connector.get_cumulative_metrics().items()
-        }
-
-    store_stats = {}
-    if hasattr(connector, "get_store"):
-        store_stats = dict(connector.get_store().stats())
-
-    return cumulative, store_stats
-
-
-def _diff_counts(after: Mapping[str, int], before: Mapping[str, int]) -> dict[str, int]:
-    keys = set(before) | set(after)
-    return {key: int(after.get(key, 0)) - int(before.get(key, 0)) for key in sorted(keys)}
+from spyre_kv_reuse_common import (
+    build_prompt,
+    common_prefix_len,
+    diff_counts,
+    drain_scheduler_stats,
+    get_worker_probe_state,
+    set_local_dist_defaults,
+)
 
 
 def _run_once(llm, prompt: str, sampling_params, label: str) -> dict[str, Any]:
-    worker_before, store_before = _get_worker_probe_state()
+    worker_before, store_before = get_worker_probe_state()
     _ = llm.generate([prompt], sampling_params, use_tqdm=False)
-    scheduler_stats = _drain_scheduler_stats(llm)
-    worker_after, store_after = _get_worker_probe_state()
+    scheduler_stats = drain_scheduler_stats(llm)
+    worker_after, store_after = get_worker_probe_state()
 
     return {
         "label": label,
         "scheduler_stats": scheduler_stats,
-        "worker_delta": _diff_counts(worker_after, worker_before),
+        "worker_delta": diff_counts(worker_after, worker_before),
         "store_before": store_before,
         "store_after": store_after,
     }
@@ -140,7 +60,7 @@ def main() -> int:
     os.environ.setdefault("VLLM_SPYRE_DYNAMO_BACKEND", args.backend)
     os.environ.setdefault("VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE", "1")
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-    _set_local_dist_defaults()
+    set_local_dist_defaults()
 
     import vllm_spyre
 
@@ -174,12 +94,12 @@ def main() -> int:
 
     try:
         tokenizer = llm.get_tokenizer()
-        prompt_exact = _build_prompt(
+        prompt_exact = build_prompt(
             tokenizer,
             args.shared_prefix_tokens,
             tail="\n\nQuestion: Summarize the long prefix in one sentence.",
         )
-        prompt_partial = _build_prompt(
+        prompt_partial = build_prompt(
             tokenizer,
             args.shared_prefix_tokens,
             tail="\n\nQuestion: List three keywords from the long prefix.",
@@ -187,13 +107,11 @@ def main() -> int:
 
         prompt_exact_tokens = tokenizer.encode(prompt_exact)
         prompt_partial_tokens = tokenizer.encode(prompt_partial)
-        common_prefix_tokens = _common_prefix_len(
-            prompt_exact_tokens, prompt_partial_tokens
-        )
+        common_prefix_tokens = common_prefix_len(prompt_exact_tokens, prompt_partial_tokens)
         block_size = int(llm.llm_engine.vllm_config.cache_config.block_size)
 
         # Discard any setup-time stats so the probe only reflects request traffic.
-        _ = _drain_scheduler_stats(llm)
+        _ = drain_scheduler_stats(llm)
 
         sampling_params = SamplingParams(
             max_tokens=args.max_new_tokens,
