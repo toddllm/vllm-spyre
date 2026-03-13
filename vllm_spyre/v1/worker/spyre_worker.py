@@ -18,8 +18,13 @@ import torch.distributed as dist
 import vllm.envs as envs
 from huggingface_hub import hf_hub_download
 from vllm.config import VllmConfig
-from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    ensure_kv_transfer_shutdown,
+    has_kv_transfer_group,
+)
+from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -168,6 +173,7 @@ class SpyreWorker(WorkerBase):
             self._warmup_spyre_fixed_size(prompt_len, self.restricted_tokens, batch_size)
 
         self.model_runner.complete_warmup()
+        self._register_connector_kv_caches()
 
         all_warmup_end_t = time.time()
         all_warmup_total_t = all_warmup_end_t - all_warmup_start_t
@@ -185,6 +191,9 @@ class SpyreWorker(WorkerBase):
         """Basic health check (override for device-specific checks)."""
         # TODO: Implement something!
         return
+
+    def shutdown(self) -> None:
+        ensure_kv_transfer_shutdown()
 
     def determine_available_memory(self) -> int:
         """Return available device memory in bytes.
@@ -225,7 +234,56 @@ class SpyreWorker(WorkerBase):
     def initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None:
         """Construct the KV cache from the provided configs.
         Currently, we do not support paged attention or kv caching"""
-        pass
+        if kv_cache_configs:
+            ensure_kv_transfer_initialized(
+                self.vllm_config, kv_cache_config=kv_cache_configs[0]
+            )
+        else:
+            ensure_kv_transfer_initialized(self.vllm_config)
+
+    def _register_connector_kv_caches(self) -> None:
+        """Register connector-facing staging KV tensors after warmup completes."""
+        if not has_kv_transfer_group():
+            return
+
+        from vllm.distributed.kv_transfer import get_kv_transfer_group
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            KVConnectorBase_V1,
+        )
+
+        connector = get_kv_transfer_group()
+        if not isinstance(connector, KVConnectorBase_V1):
+            return
+
+        if not isinstance(self.model_runner, ChunkedPrefillModelRunner):
+            logger.debug(
+                "KV cache registration skipped: model runner is not chunked prefill."
+            )
+            return
+
+        kv_caches = getattr(self.model_runner.model, "past_key_value_states", None)
+        if kv_caches is None:
+            logger.warning(
+                "Cannot register KV caches: past_key_value_states is None."
+            )
+            return
+
+        kv_caches_dict: dict[str, torch.Tensor] = {}
+        kv_cache_pairs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
+        for layer_idx, (k_cache, v_cache) in enumerate(kv_caches):
+            layer_name = f"model.layers.{layer_idx}.self_attn"
+            kv_caches_dict[layer_name] = torch.stack([k_cache, v_cache])
+            kv_cache_pairs[layer_name] = (k_cache, v_cache)
+
+        self.model_runner.set_connector_kv_cache_staging(
+            kv_staging=kv_caches_dict,
+            kv_pairs=kv_cache_pairs,
+        )
+        connector.register_kv_caches(kv_caches_dict)
+        logger.info(
+            "Registered %d KV cache layers with connector.", len(kv_caches_dict)
+        )
 
     def __init__(
         self,
@@ -523,6 +581,7 @@ class SpyreWorker(WorkerBase):
         self._cleanup_model_runner(request=[deploy_req])
 
         model_runner.complete_warmup()
+        self._register_connector_kv_caches()
 
         warmup_end_t = time.time()
         warmup_total_t = warmup_end_t - warmup_start_t

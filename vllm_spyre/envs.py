@@ -20,6 +20,9 @@ if TYPE_CHECKING:
     VLLM_SPYRE_NUM_CPUS: int = 0
     VLLM_SPYRE_REQUIRE_KNOWN_CONFIG: bool = False
     VLLM_SPYRE_MODEL_CONFIG_FILE: str | None = None
+    VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE: bool = False
+    VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE: int = 1024
+    VLLM_SPYRE_KV_STORE_MAX_BYTES: int = 0
 
 logger = init_logger(__name__)
 
@@ -132,6 +135,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Path to custom model_configs.yaml file. If not set, uses the default
     # location at vllm_spyre/config/model_configs.yaml
     "VLLM_SPYRE_MODEL_CONFIG_FILE": lambda: os.getenv("VLLM_SPYRE_MODEL_CONFIG_FILE"),
+    # Enable the Spyre-side KV connector lifecycle bridge. This remains off
+    # by default until the connector path is explicitly requested.
+    "VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE": lambda: bool(
+        int(os.getenv("VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE", "0"))
+    ),
+    # Maximum number of completed requests retained for exact-prefix reuse.
+    "VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE": lambda: int(
+        os.getenv("VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE", "1024")
+    ),
+    # Byte cap for the in-memory KV store. A value of 0 disables eviction by
+    # size and relies only on the saved-request registry cap.
+    "VLLM_SPYRE_KV_STORE_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_SPYRE_KV_STORE_MAX_BYTES", "0")
+    ),
 }
 # --8<-- [end:env-vars-definition]
 

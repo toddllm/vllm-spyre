@@ -1,5 +1,6 @@
 import importlib.metadata
 import json
+import logging
 from logging.config import dictConfig
 from typing import Any
 
@@ -7,11 +8,38 @@ from vllm.envs import VLLM_CONFIGURE_LOGGING, VLLM_LOGGING_CONFIG_PATH
 from vllm.logger import DEFAULT_LOGGING_CONFIG
 
 __version__ = importlib.metadata.version("vllm_spyre")
+logger = logging.getLogger(__name__)
+
+_connector_registered = False
 
 
 def register():
-    """Register the Spyre platform."""
+    """Register the Spyre platform and Spyre-specific KV connector."""
+    _register_kv_connector()
     return "vllm_spyre.platform.SpyrePlatform"
+
+
+def _register_kv_connector() -> None:
+    global _connector_registered
+    if _connector_registered:
+        return
+
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+
+        KVConnectorFactory.register_connector(
+            "InMemorySpyreConnector",
+            "vllm_spyre.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector",
+            "InMemorySpyreConnector",
+        )
+        _connector_registered = True
+    except ValueError:
+        # Another import path may have registered it first.
+        _connector_registered = True
+    except (ImportError, ModuleNotFoundError, AttributeError) as exc:
+        logger.debug("Deferring InMemorySpyreConnector registration: %s", exc)
 
 
 def _init_logging():

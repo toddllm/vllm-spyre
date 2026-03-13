@@ -1,3 +1,4 @@
+import copy
 import math
 import time
 from abc import ABC, abstractmethod
@@ -22,7 +23,12 @@ from vllm.utils.platform_utils import is_pin_memory_available
 
 from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput, SamplerOutput
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+    SamplerOutput,
+)
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.request import Request
 
@@ -718,11 +724,51 @@ class ChunkedPrefillModelRunner(
 
         self.prefix_cache_stats = None
 
+        from vllm_spyre.v1.worker.spyre_kv_connector_bridge import (
+            maybe_create_bridge,
+        )
+
+        self._kv_bridge = maybe_create_bridge(vllm_config)
+        self._connector_kv_staging: dict[str, torch.Tensor] | None = None
+        self._connector_kv_pairs: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None
+
     def load_model(self) -> None:
         self._model = SpyreCausalLM(
             vllm_config=self.vllm_config,
             rank=self.rank,
         )
+
+    def set_connector_kv_cache_staging(
+        self,
+        kv_staging: dict[str, torch.Tensor],
+        kv_pairs: dict[str, tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        self._connector_kv_staging = kv_staging
+        self._connector_kv_pairs = kv_pairs
+
+    def _sync_loaded_kv_from_staging(self) -> None:
+        if self._connector_kv_staging is None or self._connector_kv_pairs is None:
+            return
+
+        for layer_name, kv_tensor in self._connector_kv_staging.items():
+            kv_pair = self._connector_kv_pairs.get(layer_name)
+            if kv_pair is None:
+                continue
+            k_cache, v_cache = kv_pair
+            k_cache.copy_(kv_tensor[0])
+            v_cache.copy_(kv_tensor[1])
+
+    def _sync_fms_kv_to_staging(self) -> None:
+        if self._connector_kv_staging is None or self._connector_kv_pairs is None:
+            return
+
+        for layer_name, kv_pair in self._connector_kv_pairs.items():
+            kv_tensor = self._connector_kv_staging.get(layer_name)
+            if kv_tensor is None:
+                continue
+            k_cache, v_cache = kv_pair
+            kv_tensor[0].copy_(k_cache)
+            kv_tensor[1].copy_(v_cache)
 
     @property
     def vocab_size(self) -> int:
@@ -1423,8 +1469,26 @@ class ChunkedPrefillModelRunner(
         self.update_states(scheduler_output)
 
         if not scheduler_output.total_num_scheduled_tokens:
-            # Return empty ModelRunnerOutput if there's no work to do.
+            if self._kv_bridge is not None:
+                kv_output = self._kv_bridge.no_forward(scheduler_output)
+                if kv_output is not None and not kv_output.is_empty():
+                    result = copy.copy(self.get_empty_output())
+                    result.kv_connector_output = kv_output
+                    return result
             return self.get_empty_output()
+
+        bridge_active = (
+            self._kv_bridge is not None
+            and self._kv_bridge.begin_step(scheduler_output)
+        )
+        bridge_finished = False
+
+        def _finalize_bridge() -> KVConnectorOutput | None:
+            nonlocal bridge_finished
+            if not bridge_active or bridge_finished:
+                return None
+            bridge_finished = True
+            return self._kv_bridge.finish_step()
 
         # Initialize internal request states if this is the first chunk of a very new prefill
         self.maybe_setup_new_prefill(scheduler_output)
@@ -1441,6 +1505,9 @@ class ChunkedPrefillModelRunner(
             else model_input.input_tokens
         )
         with set_forward_context(attn_metadata, self.vllm_config):
+            if bridge_active:
+                self._kv_bridge.before_forward(scheduler_output)
+                self._sync_loaded_kv_from_staging()
             logits = self.model(
                 input_ids_or_embeds=input_ids_or_embeds,
                 positions=model_input.input_positions,
@@ -1448,16 +1515,24 @@ class ChunkedPrefillModelRunner(
                 is_prompt=model_input.is_prompt,
             )
 
+        if bridge_active:
+            self._sync_fms_kv_to_staging()
+            self._kv_bridge.after_forward(scheduler_output)
+
         # If the prompt is being prefilled we don't have to sample
         # and generate a new token.
         if is_prefill and self.check_incomplete_prefill(scheduler_output):
             # Only return outputs from the driver worker
             if not self.is_driver_worker:
+                _finalize_bridge()
                 return self.get_empty_output()
 
             t1 = time.time() - t0
             logger.debug("t_forward_pass: %.2fms [prefill single chunk][batch size 1]", (t1 * 1000))
-            return self.prefill_output()
+            model_output = self.prefill_output()
+            if bridge_active:
+                model_output.kv_connector_output = _finalize_bridge()
+            return model_output
 
         # Sample the next token.
         output: SamplerOutput | None = self.model.sample(
@@ -1491,9 +1566,12 @@ class ChunkedPrefillModelRunner(
 
         # Only return outputs from the driver worker
         if not self.is_driver_worker:
+            _finalize_bridge()
             return self.get_empty_output()
 
         model_output = self.sampled_output(output, is_prefill)
+        if bridge_active:
+            model_output.kv_connector_output = _finalize_bridge()
         return model_output
 
     def prefill_output(self) -> SpyreModelRunnerOutput:
