@@ -334,6 +334,8 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
         # delegate to super of SpyreScheduler: base V1 Scheduler
         outputs = super(SpyreScheduler, self).schedule()
 
+        self._update_connector_for_running_prefills(outputs)
+
         # restore holdbacks after running the base scheduler
         self.running = self.running + running_holdback
         while holdback_queue:
@@ -346,6 +348,38 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
         ):
             logger.debug("Scheduled tokens in this step: %s", outputs.num_scheduled_tokens)
         return outputs
+
+    def _update_connector_for_running_prefills(self, outputs: "SchedulerOutput") -> None:
+        """Mirror connector alloc bookkeeping for running prefill continuations.
+
+        The base scheduler only updates connector state when a request comes
+        from WAITING/PREEMPTED. Spyre chunked-prefill continuation chunks are
+        scheduled from RUNNING, so we need to record their current block layout
+        here or later prompt blocks never get persisted to the connector.
+        """
+        if self.connector is None or not self.ongoing_prefills:
+            return
+
+        cached_reqs = getattr(outputs, "scheduled_cached_reqs", None)
+        if cached_reqs is None:
+            return
+
+        ongoing_prefill_ids = {req.request_id for req in self.ongoing_prefills}
+        for req_id in cached_reqs.req_ids:
+            if req_id in cached_reqs.resumed_req_ids:
+                continue
+            if req_id not in ongoing_prefill_ids:
+                continue
+
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+
+            self.connector.update_state_after_alloc(
+                request,
+                self.kv_cache_manager.get_blocks(req_id),
+                0,
+            )
 
     def can_schedule_prefill(self, request: Request) -> bool:
         # running and waiting queues are both empty, we can start a new batch

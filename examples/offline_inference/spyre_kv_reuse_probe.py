@@ -220,21 +220,21 @@ def main() -> int:
         print(json.dumps(summary, indent=2, sort_keys=True))
 
         if not args.no_assert_reuse:
-            exact_matched = exact["scheduler_stats"].get("matched_tokens", 0)
-            partial_matched = partial["scheduler_stats"].get("matched_tokens", 0)
             exact_loaded = exact["worker_delta"].get("blocks_loaded", 0)
+            exact_missing = exact["worker_delta"].get("blocks_missing", 0)
             partial_loaded = partial["worker_delta"].get("blocks_loaded", 0)
+            partial_missing = partial["worker_delta"].get("blocks_missing", 0)
 
             if warm["worker_delta"].get("blocks_saved", 0) <= 0:
                 raise SystemExit(
                     "Probe failed: warm request did not save any connector entries."
                 )
-            if exact_matched < block_size or exact_loaded <= 0:
+            if exact_loaded <= 0 or exact_missing > 0:
                 raise SystemExit(
                     "Probe failed: exact replay did not show connector reuse."
                 )
             if common_prefix_tokens >= block_size and (
-                partial_matched < block_size or partial_loaded <= 0
+                partial_loaded <= 0 or partial_missing > 0
             ):
                 raise SystemExit(
                     "Probe failed: partial-prefix replay did not show connector reuse."

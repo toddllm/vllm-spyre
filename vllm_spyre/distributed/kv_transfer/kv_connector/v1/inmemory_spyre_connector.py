@@ -298,9 +298,11 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             if saved_len == 0:
                 continue
 
-            common_len = min(saved_len, len(prompt_tuple))
-            if prompt_tuple[:common_len] != saved.prompt_token_ids[:common_len]:
-                continue
+            common_len = 0
+            for prompt_token, saved_token in zip(prompt_tuple, saved.prompt_token_ids):
+                if prompt_token != saved_token:
+                    break
+                common_len += 1
 
             aligned = (common_len // self._block_size) * self._block_size
             if aligned > best_tokens_total:

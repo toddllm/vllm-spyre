@@ -9,6 +9,7 @@ These unit tests mock the scheduler dependencies and call the actual schedule() 
 import pytest
 from unittest.mock import Mock, patch
 from vllm import SamplingParams
+from vllm.v1.core.sched.output import CachedRequestData
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue
@@ -46,6 +47,9 @@ def mocked_scheduler():
     scheduler.block_size = 64
     scheduler.n_free_blocks = 100
     scheduler.max_batch_tkv_limit = "8192"
+    scheduler.requests = {}
+    scheduler.connector = None
+    scheduler.kv_cache_manager = Mock()
 
     # Mock the base scheduler's schedule method and can_schedule_prefill,
     # but ChunkedPrefillSpyreScheduler.schedule uses the code implementation
@@ -249,6 +253,49 @@ class TestSchedulerStructuredOutputHandling:
         # But structured_output_request should be None
         assert request.structured_output_request is None
         assert request.status == RequestStatus.WAITING
+
+    def test_scheduler_updates_connector_for_ongoing_prefill_continuations(
+        self, mocked_scheduler
+    ):
+        sampling_params = SamplingParams(max_tokens=20, temperature=0.0)
+        request = Request(
+            request_id="prefill_req",
+            sampling_params=sampling_params,
+            prompt_token_ids=list(range(200)),
+            eos_token_id=None,
+            arrival_time=0,
+            lora_request=None,
+            pooling_params=None,
+        )
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens = 128
+
+        mocked_scheduler.running = [request]
+        mocked_scheduler.ongoing_prefills = [request]
+        mocked_scheduler.requests = {request.request_id: request}
+        mocked_scheduler.connector = Mock()
+        mocked_scheduler.kv_cache_manager.get_blocks.return_value = "prefill-blocks"
+
+        outputs = Mock()
+        outputs.scheduled_cached_reqs = CachedRequestData(
+            req_ids=[request.request_id],
+            resumed_req_ids=set(),
+            new_token_ids=[],
+            all_token_ids={},
+            new_block_ids=[None],
+            num_computed_tokens=[128],
+            num_output_tokens=[0],
+        )
+        outputs.num_scheduled_tokens = {request.request_id: 64}
+
+        with patch("vllm.v1.core.sched.scheduler.Scheduler.schedule", return_value=outputs):
+            mocked_scheduler.schedule()
+
+        mocked_scheduler.connector.update_state_after_alloc.assert_called_once_with(
+            request,
+            "prefill-blocks",
+            0,
+        )
 
 
 # Made with Bob

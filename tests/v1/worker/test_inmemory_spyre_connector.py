@@ -265,6 +265,23 @@ class TestInMemorySpyreConnector:
         _, recving = worker.get_finished({"req-B"})
         assert recving == {"req-B"}
 
+    def test_scheduler_driven_partial_prefix_reuse(self):
+        block_size = 4
+        store = InMemoryKVStore()
+        sched = _make_connector(store=store, role=KVConnectorRole.SCHEDULER, block_size=block_size)
+
+        prompt_a = [10, 20, 30, 40, 50, 60, 70, 80]
+        prompt_b = [10, 20, 30, 40, 50, 99, 98]
+
+        req_a = _make_request("req-A", prompt_a)
+        sched.request_finished(req_a, [0, 1])
+
+        req_b = _make_request("req-B", prompt_b)
+        matched, is_async = sched.get_num_new_matched_tokens(req_b, 0)
+
+        assert matched == 4
+        assert is_async is False
+
     def test_load_miss_reports_error_blocks(self):
         worker = _make_connector(store=InMemoryKVStore(), role=KVConnectorRole.WORKER, block_size=4)
         staging = _make_staging_caches(
