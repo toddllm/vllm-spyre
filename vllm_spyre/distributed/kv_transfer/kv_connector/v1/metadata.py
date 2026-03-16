@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -32,7 +33,7 @@ class StoreKey:
 
 
 @dataclass
-class InMemoryKVEntry:
+class HostMemoryKVEntry:
     data: torch.Tensor
     dtype: str
     shape: tuple[int, ...]
@@ -43,6 +44,50 @@ class InMemoryKVEntry:
         self, expected_shape: tuple[int, ...], expected_dtype: str
     ) -> bool:
         return self.shape == expected_shape and self.dtype == expected_dtype
+
+
+class SpyreKVStoreBackend(ABC):
+    @property
+    @abstractmethod
+    def size(self) -> int: ...
+
+    @property
+    @abstractmethod
+    def current_bytes(self) -> int: ...
+
+    @property
+    @abstractmethod
+    def max_bytes(self) -> int: ...
+
+    @property
+    @abstractmethod
+    def evictions(self) -> int: ...
+
+    @abstractmethod
+    def put(
+        self,
+        key: StoreKey,
+        data: torch.Tensor,
+        source_req: str = "",
+    ) -> tuple[int, bool]: ...
+
+    @abstractmethod
+    def get(self, key: StoreKey) -> HostMemoryKVEntry | None: ...
+
+    @abstractmethod
+    def load_into(self, key: StoreKey, dest: torch.Tensor) -> bool: ...
+
+    @abstractmethod
+    def contains(self, key: StoreKey) -> bool: ...
+
+    @abstractmethod
+    def remove_by_req(self, req_id: str) -> int: ...
+
+    @abstractmethod
+    def clear(self) -> None: ...
+
+    @abstractmethod
+    def stats(self) -> dict[str, Any]: ...
 
 
 @dataclass
@@ -162,9 +207,9 @@ class SpyreConnectorMeta(KVConnectorMetadata):
         return [f"model.layers.{i}.self_attn" for i in range(num_layers)]
 
 
-class InMemoryKVStore:
+class HostMemoryKVStoreBackend(SpyreKVStoreBackend):
     def __init__(self, max_bytes: int = 0) -> None:
-        self._store: dict[StoreKey, InMemoryKVEntry] = {}
+        self._store: dict[StoreKey, HostMemoryKVEntry] = {}
         self._version_counter = 0
         self._max_bytes = max(0, max_bytes)
         self._current_bytes = 0
@@ -187,7 +232,7 @@ class InMemoryKVStore:
         return self._evictions
 
     @staticmethod
-    def _entry_bytes(entry: InMemoryKVEntry) -> int:
+    def _entry_bytes(entry: HostMemoryKVEntry) -> int:
         return entry.data.nelement() * entry.data.element_size()
 
     def put(
@@ -204,7 +249,7 @@ class InMemoryKVStore:
             old = self._store[key]
             self._current_bytes -= self._entry_bytes(old)
 
-        entry = InMemoryKVEntry(
+        entry = HostMemoryKVEntry(
             data=data.detach().clone().cpu(),
             dtype=str(data.dtype),
             shape=tuple(data.shape),
@@ -230,8 +275,19 @@ class InMemoryKVStore:
         self._evictions += 1
         return oldest_key
 
-    def get(self, key: StoreKey) -> InMemoryKVEntry | None:
+    def get(self, key: StoreKey) -> HostMemoryKVEntry | None:
         return self._store.get(key)
+
+    def load_into(self, key: StoreKey, dest: torch.Tensor) -> bool:
+        entry = self.get(key)
+        if entry is None:
+            return False
+
+        try:
+            dest.copy_(entry.data)
+        except RuntimeError:
+            return False
+        return True
 
     def contains(self, key: StoreKey) -> bool:
         return key in self._store
@@ -258,6 +314,11 @@ class InMemoryKVStore:
             "max_bytes": self._max_bytes,
             "evictions": self._evictions,
         }
+
+
+# Backward-compatible aliases for the current slice, tests, and examples.
+InMemoryKVEntry = HostMemoryKVEntry
+InMemoryKVStore = HostMemoryKVStoreBackend
 
 
 _STATS_KEYS = (

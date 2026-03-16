@@ -19,11 +19,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from vllm_spyre.distributed.kv_transfer.kv_connector.v1.metadata import (
-    InMemoryKVStore,
+    HostMemoryKVStoreBackend,
     KVKind,
     SpyreConnectorMeta,
     SpyreConnectorRequestMeta,
     SpyreConnectorStats,
+    SpyreKVStoreBackend,
     StoreKey,
 )
 
@@ -37,13 +38,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_GLOBAL_STORE: InMemoryKVStore | None = None
+_GLOBAL_STORE: SpyreKVStoreBackend | None = None
 
 
-def get_global_store() -> InMemoryKVStore:
+def get_global_store() -> SpyreKVStoreBackend:
     global _GLOBAL_STORE
     if _GLOBAL_STORE is None:
-        _GLOBAL_STORE = InMemoryKVStore(
+        _GLOBAL_STORE = HostMemoryKVStoreBackend(
             max_bytes=envs_spyre.VLLM_SPYRE_KV_STORE_MAX_BYTES
         )
     return _GLOBAL_STORE
@@ -54,7 +55,7 @@ def reset_global_store() -> None:
     if _GLOBAL_STORE is not None:
         _GLOBAL_STORE.clear()
     else:
-        _GLOBAL_STORE = InMemoryKVStore(
+        _GLOBAL_STORE = HostMemoryKVStoreBackend(
             max_bytes=envs_spyre.VLLM_SPYRE_KV_STORE_MAX_BYTES
         )
 
@@ -80,7 +81,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         vllm_config: "VllmConfig",
         role: KVConnectorRole,
         kv_cache_config: "KVCacheConfig | None" = None,
-        store: InMemoryKVStore | None = None,
+        store: SpyreKVStoreBackend | None = None,
     ):
         super().__init__(
             vllm_config=vllm_config,
@@ -197,16 +198,9 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                         block_id=src_block_id,
                         kv_kind=kv_kind,
                     )
-                    entry = self._store.get(store_key)
-                    if entry is None:
-                        miss_count += 1
-                        self._load_error_block_ids.add(dest_bid)
-                        continue
-
-                    try:
-                        staging[kv_dim][dest_bid].copy_(entry.data)
+                    if self._store.load_into(store_key, staging[kv_dim][dest_bid]):
                         load_count += 1
-                    except RuntimeError:
+                    else:
                         miss_count += 1
                         self._load_error_block_ids.add(dest_bid)
 
@@ -460,7 +454,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             "saved_requests_count": len(self._saved_requests),
         }
 
-    def get_store(self) -> InMemoryKVStore:
+    def get_store(self) -> SpyreKVStoreBackend:
         return self._store
 
     def reset_probe_state(

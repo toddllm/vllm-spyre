@@ -11,6 +11,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_spyre.distributed.kv_transfer.kv_connector.v1.metadata import (
+    HostMemoryKVStoreBackend,
     InMemoryKVStore,
     KVKind,
     SpyreConnectorMeta,
@@ -140,6 +141,19 @@ class TestMetadataSchema:
         )
         with pytest.raises(ValueError, match="Duplicate destination block ID"):
             meta.validate()
+
+    def test_host_memory_store_backend_loads_into_destination_tensor(self):
+        store = HostMemoryKVStoreBackend()
+        key = StoreKey(req_id="req-1", layer_idx=0, block_id=0, kv_kind=KVKind.K)
+        source = torch.arange(16, dtype=torch.float32).reshape(2, 2, 4)
+
+        version, was_overwrite = store.put(key, source, source_req="req-1")
+        assert version == 1
+        assert was_overwrite is False
+
+        dest = torch.zeros_like(source)
+        assert store.load_into(key, dest) is True
+        assert torch.equal(dest, source)
 
 
 @pytest.mark.cpu
