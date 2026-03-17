@@ -59,7 +59,7 @@ def get_global_store(store_backend_name: str | None = None) -> SpyreKVStoreBacke
 def reset_global_store(store_backend_name: str | None = None) -> None:
     global _GLOBAL_STORE
     if _GLOBAL_STORE is not None:
-        _GLOBAL_STORE.clear()
+        _GLOBAL_STORE.shutdown()
     _GLOBAL_STORE = _build_configured_store(store_backend_name)
 
 

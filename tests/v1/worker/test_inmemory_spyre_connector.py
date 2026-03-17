@@ -15,6 +15,7 @@ from vllm_spyre.distributed.kv_transfer.kv_connector.v1.metadata import (
     HostMemoryKVStoreBackend,
     InMemoryKVStore,
     KVKind,
+    SerializedUDSProcessKVStoreBackend,
     SerializedHostMemoryKVStoreBackend,
     SpyreConnectorMeta,
     SpyreConnectorRequestMeta,
@@ -180,20 +181,29 @@ class TestMetadataSchema:
         assert store.load_into(key, dest) is True
         assert torch.equal(dest, source)
 
+    @pytest.mark.parametrize(
+        "backend_cls",
+        [SerializedHostMemoryKVStoreBackend, SerializedUDSProcessKVStoreBackend],
+    )
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_serialized_host_memory_store_backend_loads_into_destination_tensor(self, dtype):
-        store = SerializedHostMemoryKVStoreBackend()
+    def test_serialized_store_backends_load_into_destination_tensor(self, backend_cls, dtype):
+        store = backend_cls()
         key = StoreKey(req_id="req-1", layer_idx=0, block_id=0, kv_kind=KVKind.K)
         source = torch.arange(16, dtype=torch.float32).reshape(2, 2, 4).to(dtype)
+        try:
+            version, was_overwrite = store.put(key, source, source_req="req-1")
+            assert version == 1
+            assert was_overwrite is False
 
-        version, was_overwrite = store.put(key, source, source_req="req-1")
-        assert version == 1
-        assert was_overwrite is False
-
-        dest = torch.zeros_like(source)
-        assert store.load_into(key, dest) is True
-        assert torch.equal(dest, source)
-        assert store.stats()["backend_name"] == "serialized_host_memory"
+            dest = torch.zeros_like(source)
+            assert store.load_into(key, dest) is True
+            assert torch.equal(dest, source)
+            assert store.stats()["backend_name"] in {
+                "serialized_host_memory",
+                "serialized_uds_process_store",
+            }
+        finally:
+            store.shutdown()
 
     def test_build_spyre_kv_store_backend_rejects_unknown_name(self):
         with pytest.raises(ValueError, match="Unknown Spyre KV store backend"):
@@ -201,20 +211,26 @@ class TestMetadataSchema:
 
     @pytest.mark.parametrize(
         "backend_cls",
-        [HostMemoryKVStoreBackend, SerializedHostMemoryKVStoreBackend],
+        [
+            HostMemoryKVStoreBackend,
+            SerializedHostMemoryKVStoreBackend,
+            SerializedUDSProcessKVStoreBackend,
+        ],
     )
     def test_store_max_bytes_evicts_oldest_request_as_whole_unit(self, backend_cls):
         store = backend_cls(max_bytes=128)
+        try:
+            _store_complete_block(store, "req-A", 0)
+            assert store.available_prefix_blocks("req-A", [0]) == 1
 
-        _store_complete_block(store, "req-A", 0)
-        assert store.available_prefix_blocks("req-A", [0]) == 1
+            _store_complete_block(store, "req-B", 0)
 
-        _store_complete_block(store, "req-B", 0)
-
-        assert store.available_prefix_blocks("req-A", [0]) == 0
-        assert store.available_prefix_blocks("req-B", [0]) == 1
-        assert store.stats()["unique_requests"] == 1
-        assert store.stats()["evictions"] == 1
+            assert store.available_prefix_blocks("req-A", [0]) == 0
+            assert store.available_prefix_blocks("req-B", [0]) == 1
+            assert store.stats()["unique_requests"] == 1
+            assert store.stats()["evictions"] == 1
+        finally:
+            store.shutdown()
 
     def test_reset_global_store_uses_selected_backend(self, monkeypatch: pytest.MonkeyPatch):
         from vllm_spyre.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector import (

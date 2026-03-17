@@ -26,6 +26,8 @@ BASELINE_ENV_VARS = (
     "VLLM_SPYRE_KV_STORE_MAX_BYTES",
 )
 
+NON_DELTA_METRIC_KEYS = frozenset({"saved_requests_count"})
+
 
 def set_local_dist_defaults() -> None:
     os.environ.setdefault("MASTER_ADDR", "localhost")
@@ -164,7 +166,11 @@ def get_worker_probe_state() -> tuple[dict[str, int], dict[str, Any]]:
 
 def diff_counts(after: Mapping[str, int], before: Mapping[str, int]) -> dict[str, int]:
     keys = set(before) | set(after)
-    return {key: int(after.get(key, 0)) - int(before.get(key, 0)) for key in sorted(keys)}
+    return {
+        key: int(after.get(key, 0)) - int(before.get(key, 0))
+        for key in sorted(keys)
+        if key not in NON_DELTA_METRIC_KEYS
+    }
 
 
 def reset_probe_state(llm) -> None:

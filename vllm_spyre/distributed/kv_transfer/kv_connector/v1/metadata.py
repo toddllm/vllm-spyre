@@ -15,6 +15,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorStats,
 )
+from vllm_spyre.distributed.kv_transfer.kv_connector.v1.local_transport_store import (
+    UDSProcessKVTransport,
+)
 
 
 class KVKind(str, Enum):
@@ -51,6 +54,20 @@ class HostMemoryKVEntry:
 @dataclass
 class SerializedHostMemoryKVEntry:
     payload: bytes
+    dtype: str
+    shape: tuple[int, ...]
+    version: int = 1
+    source_req: str = ""
+
+    def matches_shape_and_dtype(
+        self, expected_shape: tuple[int, ...], expected_dtype: str
+    ) -> bool:
+        return self.shape == expected_shape and self.dtype == expected_dtype
+
+
+@dataclass
+class SerializedUDSProcessKVEntry:
+    payload_size: int
     dtype: str
     shape: tuple[int, ...]
     version: int = 1
@@ -108,6 +125,9 @@ class SpyreKVStoreBackend(ABC):
 
     @abstractmethod
     def clear(self) -> None: ...
+
+    @abstractmethod
+    def shutdown(self) -> None: ...
 
     @abstractmethod
     def stats(self) -> dict[str, Any]: ...
@@ -386,6 +406,9 @@ class HostMemoryKVStoreBackend(SpyreKVStoreBackend):
             "evictions": self._evictions,
         }
 
+    def shutdown(self) -> None:
+        self.clear()
+
 
 class SerializedHostMemoryKVStoreBackend(SpyreKVStoreBackend):
     def __init__(self, max_bytes: int = 0) -> None:
@@ -563,10 +586,214 @@ class SerializedHostMemoryKVStoreBackend(SpyreKVStoreBackend):
             "evictions": self._evictions,
         }
 
+    def shutdown(self) -> None:
+        self.clear()
+
+
+class SerializedUDSProcessKVStoreBackend(SpyreKVStoreBackend):
+    def __init__(self, max_bytes: int = 0) -> None:
+        self._store: dict[StoreKey, SerializedUDSProcessKVEntry] = {}
+        self._request_keys: dict[str, set[StoreKey]] = {}
+        self._request_order: OrderedDict[str, None] = OrderedDict()
+        self._transport = UDSProcessKVTransport()
+        self._version_counter = 0
+        self._max_bytes = max(0, max_bytes)
+        self._current_bytes = 0
+        self._evictions = 0
+
+    @property
+    def backend_name(self) -> str:
+        return "serialized_uds_process_store"
+
+    @property
+    def size(self) -> int:
+        return len(self._store)
+
+    @property
+    def current_bytes(self) -> int:
+        return self._current_bytes
+
+    @property
+    def max_bytes(self) -> int:
+        return self._max_bytes
+
+    @property
+    def evictions(self) -> int:
+        return self._evictions
+
+    @staticmethod
+    def _entry_bytes(entry: SerializedUDSProcessKVEntry) -> int:
+        return entry.payload_size
+
+    @staticmethod
+    def _serialize_tensor(data: torch.Tensor) -> bytes:
+        buffer = io.BytesIO()
+        torch.save(data.detach().clone().cpu(), buffer)
+        return buffer.getvalue()
+
+    @staticmethod
+    def _materialize_tensor(payload: bytes) -> torch.Tensor:
+        buffer = io.BytesIO(payload)
+        return torch.load(buffer, map_location="cpu", weights_only=True)
+
+    @staticmethod
+    def _request_id_for(key: StoreKey, source_req: str) -> str:
+        return source_req or key.req_id
+
+    def _track_key(self, req_id: str, key: StoreKey) -> None:
+        keys = self._request_keys.setdefault(req_id, set())
+        keys.add(key)
+        self._request_order.pop(req_id, None)
+        self._request_order[req_id] = None
+
+    def put(
+        self,
+        key: StoreKey,
+        data: torch.Tensor,
+        source_req: str = "",
+    ) -> tuple[int, bool]:
+        req_id = self._request_id_for(key, source_req)
+        self._version_counter += 1
+        version = self._version_counter
+        was_overwrite = key in self._store
+
+        if was_overwrite:
+            old = self._store[key]
+            self._current_bytes -= self._entry_bytes(old)
+
+        payload = self._serialize_tensor(data)
+        entry = SerializedUDSProcessKVEntry(
+            payload_size=len(payload),
+            dtype=str(data.dtype),
+            shape=tuple(data.shape),
+            version=version,
+            source_req=source_req,
+        )
+        entry_size = self._entry_bytes(entry)
+
+        if self._max_bytes > 0:
+            while self._store and self._current_bytes + entry_size > self._max_bytes:
+                if self._evict_oldest_request(exclude_req_id=req_id) is None:
+                    break
+
+        self._transport.put(key, payload)
+        self._store[key] = entry
+        self._track_key(req_id, key)
+        self._current_bytes += entry_size
+        return version, was_overwrite
+
+    def _evict_oldest_request(self, exclude_req_id: str | None = None) -> str | None:
+        for req_id in list(self._request_order.keys()):
+            if req_id == exclude_req_id:
+                continue
+            if self.remove_by_req(req_id) > 0:
+                self._evictions += 1
+                return req_id
+        return None
+
+    def get(self, key: StoreKey) -> HostMemoryKVEntry | None:
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        payload = self._transport.get(key)
+        if payload is None:
+            return None
+        return HostMemoryKVEntry(
+            data=self._materialize_tensor(payload),
+            dtype=entry.dtype,
+            shape=entry.shape,
+            version=entry.version,
+            source_req=entry.source_req,
+        )
+
+    def load_into(self, key: StoreKey, dest: torch.Tensor) -> bool:
+        entry = self._store.get(key)
+        if entry is None:
+            return False
+
+        payload = self._transport.get(key)
+        if payload is None:
+            return False
+
+        try:
+            dest.copy_(self._materialize_tensor(payload))
+        except RuntimeError:
+            return False
+        return True
+
+    def contains(self, key: StoreKey) -> bool:
+        return key in self._store
+
+    def available_prefix_blocks(self, req_id: str, block_ids: list[int]) -> int:
+        req_keys = self._request_keys.get(req_id)
+        if not req_keys:
+            return 0
+
+        layer_ids = sorted({key.layer_idx for key in req_keys})
+        if not layer_ids:
+            return 0
+
+        available = 0
+        for block_id in block_ids:
+            block_complete = True
+            for layer_idx in layer_ids:
+                for kv_kind in (KVKind.K, KVKind.V):
+                    if StoreKey(req_id, layer_idx, block_id, kv_kind) not in self._store:
+                        block_complete = False
+                        break
+                if not block_complete:
+                    break
+            if not block_complete:
+                break
+            available += 1
+        return available
+
+    def remove_by_req(self, req_id: str) -> int:
+        keys = list(self._request_keys.pop(req_id, ()))
+        removed = 0
+        if keys:
+            removed = self._transport.delete_keys(keys)
+        for key in keys:
+            entry = self._store.pop(key, None)
+            if entry is not None:
+                self._current_bytes -= self._entry_bytes(entry)
+        self._request_order.pop(req_id, None)
+        return removed
+
+    def clear(self) -> None:
+        self._store.clear()
+        self._request_keys.clear()
+        self._request_order.clear()
+        self._version_counter = 0
+        self._current_bytes = 0
+        self._evictions = 0
+        self._transport.clear()
+
+    def shutdown(self) -> None:
+        self._store.clear()
+        self._request_keys.clear()
+        self._request_order.clear()
+        self._version_counter = 0
+        self._current_bytes = 0
+        self._evictions = 0
+        self._transport.shutdown()
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "backend_name": self.backend_name,
+            "total_entries": len(self._store),
+            "unique_requests": len(self._request_keys),
+            "version_counter": self._version_counter,
+            "memory_estimate_bytes": self._current_bytes,
+            "max_bytes": self._max_bytes,
+            "evictions": self._evictions,
+        }
+
 
 _STORE_BACKEND_TYPES: dict[str, type[SpyreKVStoreBackend]] = {
     "host_memory": HostMemoryKVStoreBackend,
     "serialized_host_memory": SerializedHostMemoryKVStoreBackend,
+    "serialized_uds_process_store": SerializedUDSProcessKVStoreBackend,
 }
 
 
