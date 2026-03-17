@@ -12,6 +12,9 @@ from vllm.v1.request import Request, RequestStatus
 
 import vllm_spyre.envs as envs_spyre
 from vllm_spyre.platform import SpyrePlatform
+from vllm_spyre.distributed.kv_transfer.kv_connector.v1.metadata import (
+    SpyreConnectorMeta,
+)
 from vllm_spyre.v1.worker.spyre_model_runner import SpyreModelRunnerOutput
 
 if TYPE_CHECKING:
@@ -375,6 +378,8 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
                         list(group) for group in block_ids
                     )
 
+        added_connector_state = False
+
         for request in self.ongoing_prefills:
             req_id = request.request_id
             if req_id not in scheduled_req_ids:
@@ -413,6 +418,22 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
                 merged_block_ids,
             )
             self.connector.update_state_after_alloc(tracked_request, merged_block_ids, 0)
+            added_connector_state = True
+
+        if not added_connector_state:
+            return
+
+        extra_meta = self.connector.build_connector_meta(outputs)
+        if extra_meta is None:
+            return
+
+        current_meta = getattr(outputs, "kv_connector_metadata", None)
+        if isinstance(current_meta, SpyreConnectorMeta) and isinstance(
+            extra_meta, SpyreConnectorMeta
+        ):
+            current_meta.requests.extend(extra_meta.requests)
+        else:
+            outputs.kv_connector_metadata = extra_meta
 
     def can_schedule_prefill(self, request: Request) -> bool:
         # running and waiting queues are both empty, we can start a new batch

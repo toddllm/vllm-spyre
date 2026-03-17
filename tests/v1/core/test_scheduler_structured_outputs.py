@@ -14,6 +14,10 @@ from vllm.sampling_params import StructuredOutputsParams
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue
 from vllm_spyre.v1.core.scheduler import ChunkedPrefillSpyreScheduler
+from vllm_spyre.distributed.kv_transfer.kv_connector.v1.metadata import (
+    SpyreConnectorMeta,
+    SpyreConnectorRequestMeta,
+)
 
 
 pytestmark = pytest.mark.skip_global_cleanup
@@ -274,6 +278,7 @@ class TestSchedulerStructuredOutputHandling:
         mocked_scheduler.requests = {request.request_id: request}
         mocked_scheduler.connector = Mock()
         mocked_scheduler.kv_cache_manager.get_block_ids.return_value = ([1, 2],)
+        mocked_scheduler.connector.build_connector_meta.return_value = SpyreConnectorMeta()
 
         outputs = Mock()
         outputs.scheduled_cached_reqs = CachedRequestData(
@@ -316,6 +321,7 @@ class TestSchedulerStructuredOutputHandling:
         mocked_scheduler.requests = {request.request_id: request}
         mocked_scheduler.connector = Mock()
         mocked_scheduler.kv_cache_manager.get_block_ids.return_value = ([1, 2, 3, 4],)
+        mocked_scheduler.connector.build_connector_meta.return_value = SpyreConnectorMeta()
 
         outputs = Mock()
         outputs.scheduled_cached_reqs = CachedRequestData.make_empty()
@@ -350,6 +356,7 @@ class TestSchedulerStructuredOutputHandling:
         mocked_scheduler.requests = {request.request_id: request}
         mocked_scheduler.connector = Mock()
         mocked_scheduler.kv_cache_manager.get_block_ids.return_value = ([1, 2, 3, 4],)
+        mocked_scheduler.connector.build_connector_meta.return_value = SpyreConnectorMeta()
 
         outputs = Mock()
         outputs.scheduled_cached_reqs = CachedRequestData(
@@ -371,6 +378,68 @@ class TestSchedulerStructuredOutputHandling:
             ([1, 2, 3, 4, 5, 6],),
             0,
         )
+
+    def test_scheduler_merges_prefill_connector_meta_into_current_step_output(
+        self, mocked_scheduler
+    ):
+        sampling_params = SamplingParams(max_tokens=20, temperature=0.0)
+        request = Request(
+            request_id="prefill_req",
+            sampling_params=sampling_params,
+            prompt_token_ids=list(range(384)),
+            arrival_time=0,
+            lora_request=None,
+            pooling_params=None,
+        )
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens = 256
+
+        mocked_scheduler.running = [request]
+        mocked_scheduler.ongoing_prefills = [request]
+        mocked_scheduler.requests = {request.request_id: request}
+        mocked_scheduler.connector = Mock()
+        mocked_scheduler.kv_cache_manager.get_block_ids.return_value = ([1, 2, 3, 4],)
+        mocked_scheduler.connector.build_connector_meta.return_value = SpyreConnectorMeta(
+            requests=[
+                SpyreConnectorRequestMeta(
+                    req_id=request.request_id,
+                    block_ids=[1, 2, 3, 4, 5, 6],
+                    is_store=True,
+                    token_count=384,
+                )
+            ]
+        )
+
+        outputs = Mock()
+        outputs.kv_connector_metadata = SpyreConnectorMeta(
+            requests=[
+                SpyreConnectorRequestMeta(
+                    req_id="existing",
+                    block_ids=[9, 10],
+                    is_store=True,
+                    token_count=128,
+                )
+            ]
+        )
+        outputs.scheduled_cached_reqs = CachedRequestData(
+            req_ids=[request.request_id],
+            resumed_req_ids=set(),
+            new_token_ids=[],
+            all_token_ids={},
+            new_block_ids=[([5, 6],)],
+            num_computed_tokens=[256],
+            num_output_tokens=[0],
+        )
+        outputs.num_scheduled_tokens = {request.request_id: 128}
+
+        with patch("vllm.v1.core.sched.scheduler.Scheduler.schedule", return_value=outputs):
+            result = mocked_scheduler.schedule()
+
+        assert isinstance(result.kv_connector_metadata, SpyreConnectorMeta)
+        assert [req.req_id for req in result.kv_connector_metadata.requests] == [
+            "existing",
+            request.request_id,
+        ]
 
 
 # Made with Bob
