@@ -7,10 +7,11 @@ if str(EXAMPLES_DIR) not in sys.path:
     sys.path.insert(0, str(EXAMPLES_DIR))
 
 from spyre_kv_reuse_benchmark import (  # noqa: E402
-    DEMO_PROFILES,
     _effective_max_num_batched_tokens,
     _format_live_result_line,
+    _preview_text,
     _prompt_token_count,
+    _prompt_work_status,
     _resolve_demo_settings,
 )
 
@@ -73,10 +74,11 @@ def test_format_live_result_line_demo_style_is_cleaner():
         baseline_latency_seconds=0.186547,
         cumulative_saved_ms=102.073,
         style="demo",
+        prompt_work_status="saved prompt work reused",
     )
 
     assert line == (
-        "Repeat 1/4 using saved prompt work: 0.084s | 102.1 ms faster | 2.21x faster | total saved 102.1 ms"
+        "Repeat 1/4: 0.084s | saved prompt work reused | 102.1 ms faster | 2.21x faster | total saved 102.1 ms"
     )
 
 
@@ -141,16 +143,11 @@ def test_effective_max_num_batched_tokens_keeps_requested_value_by_default():
     )
 
 
-def test_demo_profiles_define_watchable_bigger_and_longer():
-    assert set(DEMO_PROFILES) == {"watchable", "bigger", "longer"}
-
-
-def test_resolve_demo_settings_applies_profile_and_overrides():
+def test_resolve_demo_settings_applies_explicit_overrides():
     class _Args:
-        demo_profile = "watchable"
         demo_prompt_tokens = 512
-        demo_output_tokens = 2
-        demo_reuse_turns = 5
+        demo_response_tokens = 2
+        demo_turns = 5
         demo_pause_seconds = 1.75
         shared_prefix_tokens = 192
         max_new_tokens = 8
@@ -161,7 +158,6 @@ def test_resolve_demo_settings_applies_profile_and_overrides():
 
     resolved = _resolve_demo_settings(args)
 
-    assert resolved["profile"] == "watchable"
     assert resolved["overrides"] == {
         "shared_prefix_tokens": 512,
         "max_new_tokens": 2,
@@ -172,3 +168,32 @@ def test_resolve_demo_settings_applies_profile_and_overrides():
     assert args.max_new_tokens == 2
     assert args.repeats == 5
     assert args.sleep_between_live_lines == 1.75
+
+
+def test_prompt_work_status_distinguishes_normal_vs_reused():
+    assert (
+        _prompt_work_status(
+            {"worker_delta": {"blocks_loaded": 0, "blocks_missing": 0, "blocks_saved": 48}},
+            prompt_recompute_tokens=0,
+        )
+        == "normal run"
+    )
+    assert (
+        _prompt_work_status(
+            {"worker_delta": {"blocks_loaded": 48, "blocks_missing": 0, "blocks_saved": 0}},
+            prompt_recompute_tokens=0,
+        )
+        == "saved prompt work reused"
+    )
+    assert (
+        _prompt_work_status(
+            {"worker_delta": {"blocks_loaded": 24, "blocks_missing": 0, "blocks_saved": 24}},
+            prompt_recompute_tokens=16,
+        )
+        == "partly reused saved prompt work"
+    )
+
+
+def test_preview_text_collapses_whitespace_and_truncates():
+    assert _preview_text("hello   world", 20) == "hello world"
+    assert _preview_text("abcdefghij", 7) == "abcd..."

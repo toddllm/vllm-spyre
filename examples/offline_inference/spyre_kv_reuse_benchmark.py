@@ -26,33 +26,12 @@ from spyre_kv_reuse_common import (
     common_prefix_len,
     diff_counts,
     drain_scheduler_stats,
+    extract_output_text,
     extract_output_token_count,
     get_worker_probe_state,
     reset_probe_state,
     set_local_dist_defaults,
 )
-
-
-DEMO_PROFILES: dict[str, dict[str, float | int]] = {
-    "watchable": {
-        "shared_prefix_tokens": 448,
-        "max_new_tokens": 1,
-        "repeats": 4,
-        "sleep_between_live_lines": 1.25,
-    },
-    "bigger": {
-        "shared_prefix_tokens": 448,
-        "max_new_tokens": 1,
-        "repeats": 6,
-        "sleep_between_live_lines": 1.50,
-    },
-    "longer": {
-        "shared_prefix_tokens": 448,
-        "max_new_tokens": 4,
-        "repeats": 4,
-        "sleep_between_live_lines": 1.50,
-    },
-}
 
 
 def _clear_store_backend(store_backend: str, service_socket: str | None) -> None:
@@ -111,6 +90,7 @@ def _format_live_result_line(
     baseline_latency_seconds: float | None = None,
     cumulative_saved_ms: float | None = None,
     style: str = "scientific",
+    prompt_work_status: str | None = None,
 ) -> str:
     worker_delta = run["worker_delta"]
     latency_seconds = float(run["latency_seconds"])
@@ -119,12 +99,14 @@ def _format_live_result_line(
         if stage == "exact_warmup":
             return f"Warmup (not counted): {latency_seconds:.3f}s"
         if stage == "exact_warm_baseline":
-            return f"Baseline request: {latency_seconds:.3f}s"
+            parts = [f"Baseline request: {latency_seconds:.3f}s"]
+            if prompt_work_status:
+                parts.append(prompt_work_status)
+            return " | ".join(parts)
         if stage == "exact_reuse":
-            parts = [
-                f"Repeat {turn_index}/{total_turns} using saved prompt work: "
-                f"{latency_seconds:.3f}s"
-            ]
+            parts = [f"Repeat {turn_index}/{total_turns}: {latency_seconds:.3f}s"]
+            if prompt_work_status:
+                parts.append(prompt_work_status)
             if baseline_latency_seconds is not None and latency_seconds > 0:
                 saved_ms = 1000.0 * (baseline_latency_seconds - latency_seconds)
                 parts.append(f"{saved_ms:.1f} ms faster")
@@ -162,10 +144,11 @@ def _format_live_header(
     warmup_runs: int,
     reuse_turns: int,
     sleep_between_live_lines_s: float,
+    prompt_preview: str | None,
 ) -> list[str]:
     prompt_blocks = (prompt_exact_tokens + block_size - 1) // block_size
     if style == "demo":
-        return [
+        lines = [
             "Demo: Reusing saved prompt work",
             (
                 "We first run one normal request, then repeat the same request "
@@ -180,8 +163,11 @@ def _format_live_header(
                 f"Warmups: {warmup_runs} | Repeat requests: {reuse_turns}"
                 f" | Pause between lines: {sleep_between_live_lines_s:.2f}s"
             ),
-            "",
         ]
+        if prompt_preview:
+            lines.append(f'Prompt preview: "{prompt_preview}"')
+        lines.append("")
+        return lines
 
     return [
         "live_demo "
@@ -232,27 +218,16 @@ def _format_live_footer(
 
 
 def _resolve_demo_settings(args: argparse.Namespace) -> dict[str, Any]:
-    resolved: dict[str, Any] = {
-        "profile": args.demo_profile,
-        "overrides": {},
-    }
-
-    if args.demo_profile is not None:
-        profile_settings = DEMO_PROFILES[args.demo_profile]
-        args.shared_prefix_tokens = int(profile_settings["shared_prefix_tokens"])
-        args.max_new_tokens = int(profile_settings["max_new_tokens"])
-        args.repeats = int(profile_settings["repeats"])
-        args.sleep_between_live_lines = float(profile_settings["sleep_between_live_lines"])
-
+    resolved: dict[str, Any] = {"overrides": {}}
     if args.demo_prompt_tokens is not None:
         args.shared_prefix_tokens = args.demo_prompt_tokens
         resolved["overrides"]["shared_prefix_tokens"] = args.demo_prompt_tokens
-    if args.demo_output_tokens is not None:
-        args.max_new_tokens = args.demo_output_tokens
-        resolved["overrides"]["max_new_tokens"] = args.demo_output_tokens
-    if args.demo_reuse_turns is not None:
-        args.repeats = args.demo_reuse_turns
-        resolved["overrides"]["repeats"] = args.demo_reuse_turns
+    if args.demo_response_tokens is not None:
+        args.max_new_tokens = args.demo_response_tokens
+        resolved["overrides"]["max_new_tokens"] = args.demo_response_tokens
+    if args.demo_turns is not None:
+        args.repeats = args.demo_turns
+        resolved["overrides"]["repeats"] = args.demo_turns
     if args.demo_pause_seconds is not None:
         args.sleep_between_live_lines = args.demo_pause_seconds
         resolved["overrides"]["sleep_between_live_lines"] = args.demo_pause_seconds
@@ -263,6 +238,50 @@ def _resolve_demo_settings(args: argparse.Namespace) -> dict[str, Any]:
 def _emit_live_lines(lines: list[str]) -> None:
     for line in lines:
         print(line, flush=True)
+
+
+def _preview_text(text: str, max_chars: int) -> str:
+    normalized = " ".join(text.split())
+    if max_chars <= 0 or len(normalized) <= max_chars:
+        return normalized
+    if max_chars <= 3:
+        return normalized[:max_chars]
+    return normalized[: max_chars - 3] + "..."
+
+
+def _prompt_work_status(run: dict[str, Any], *, prompt_recompute_tokens: int) -> str:
+    worker_delta = run["worker_delta"]
+    loaded = int(worker_delta.get("blocks_loaded", 0))
+    missing = int(worker_delta.get("blocks_missing", 0))
+    saved = int(worker_delta.get("blocks_saved", 0))
+
+    if loaded > 0 and missing == 0 and prompt_recompute_tokens == 0:
+        return "saved prompt work reused"
+    if loaded > 0 and missing == 0 and prompt_recompute_tokens > 0:
+        return "partly reused saved prompt work"
+    if loaded == 0 and saved > 0:
+        return "normal run"
+    return "reuse not detected"
+
+
+def _live_text_lines(
+    *,
+    style: str,
+    run: dict[str, Any],
+    baseline_output_preview: str | None,
+    answer_preview_chars: int,
+) -> list[str]:
+    if style != "demo":
+        return []
+
+    output_preview = _preview_text(str(run.get("output_text", "")), answer_preview_chars)
+    if not output_preview:
+        return []
+
+    if baseline_output_preview is not None and output_preview == baseline_output_preview:
+        return ["Answer preview: same answer as the baseline request"]
+
+    return [f'Answer preview: "{output_preview}"']
 
 
 def _sleep_between_live_lines(seconds: float) -> None:
@@ -278,11 +297,13 @@ def _run_timed_request(llm, prompt_input: Any, sampling_params, label: str) -> d
     scheduler_stats = drain_scheduler_stats(llm)
     worker_after, store_after = get_worker_probe_state()
     output_tokens = extract_output_token_count(outputs)
+    output_text = extract_output_text(outputs)
 
     return {
         "label": label,
         "latency_seconds": latency_seconds,
         "output_tokens": output_tokens,
+        "output_text": output_text,
         "tokens_per_second": (
             output_tokens / latency_seconds if latency_seconds > 0 else 0.0
         ),
@@ -363,6 +384,8 @@ def _run_exact_live_demo(
     block_size: int,
     max_new_tokens: int,
     live_output_style: str,
+    prompt_preview: str | None,
+    answer_preview_chars: int,
 ) -> dict[str, Any]:
     warmup_runs_data: list[dict[str, Any]] = []
     if print_live:
@@ -375,6 +398,7 @@ def _run_exact_live_demo(
                 warmup_runs=warmup_runs,
                 reuse_turns=reuse_turns,
                 sleep_between_live_lines_s=sleep_between_live_lines_s,
+                prompt_preview=prompt_preview,
             )
         )
         _sleep_between_live_lines(sleep_between_live_lines_s)
@@ -399,6 +423,14 @@ def _run_exact_live_demo(
                     style=live_output_style,
                 )
             ])
+            _emit_live_lines(
+                _live_text_lines(
+                    style=live_output_style,
+                    run=warmup_run,
+                    baseline_output_preview=None,
+                    answer_preview_chars=answer_preview_chars,
+                )
+            )
             _sleep_between_live_lines(sleep_between_live_lines_s)
 
     _clear_store_backend(store_backend, service_socket)
@@ -410,6 +442,10 @@ def _run_exact_live_demo(
         "exact_warm_baseline",
     )
     if print_live:
+        baseline_output_preview = _preview_text(
+            str(warm_baseline_run.get("output_text", "")),
+            answer_preview_chars,
+        )
         _emit_live_lines([
             _format_live_result_line(
                 stage="exact_warm_baseline",
@@ -417,9 +453,23 @@ def _run_exact_live_demo(
                 total_turns=1,
                 run=warm_baseline_run,
                 style=live_output_style,
+                prompt_work_status=_prompt_work_status(
+                    warm_baseline_run,
+                    prompt_recompute_tokens=0,
+                ),
             )
         ])
+        _emit_live_lines(
+            _live_text_lines(
+                style=live_output_style,
+                run=warm_baseline_run,
+                baseline_output_preview=None,
+                answer_preview_chars=answer_preview_chars,
+            )
+        )
         _sleep_between_live_lines(sleep_between_live_lines_s)
+    else:
+        baseline_output_preview = None
 
     exact_reuse_runs: list[dict[str, Any]] = []
     baseline_latency_seconds = float(warm_baseline_run["latency_seconds"])
@@ -455,8 +505,20 @@ def _run_exact_live_demo(
                     baseline_latency_seconds=baseline_latency_seconds,
                     cumulative_saved_ms=cumulative_saved_ms,
                     style=live_output_style,
+                    prompt_work_status=_prompt_work_status(
+                        exact_reuse,
+                        prompt_recompute_tokens=0,
+                    ),
                 )
             ])
+            _emit_live_lines(
+                _live_text_lines(
+                    style=live_output_style,
+                    run=exact_reuse,
+                    baseline_output_preview=baseline_output_preview,
+                    answer_preview_chars=answer_preview_chars,
+                )
+            )
             _sleep_between_live_lines(sleep_between_live_lines_s)
 
     if print_live:
@@ -501,15 +563,25 @@ def main() -> int:
         choices=("paired_benchmark", "warm_baseline_then_reuse"),
         default="paired_benchmark",
     )
+    parser.add_argument("--demo-prompt-tokens", type=int, default=None)
     parser.add_argument(
-        "--demo-profile",
-        choices=tuple(DEMO_PROFILES),
+        "--demo-response-tokens",
+        "--demo-output-tokens",
+        dest="demo_response_tokens",
+        type=int,
         default=None,
     )
-    parser.add_argument("--demo-prompt-tokens", type=int, default=None)
-    parser.add_argument("--demo-output-tokens", type=int, default=None)
-    parser.add_argument("--demo-reuse-turns", type=int, default=None)
+    parser.add_argument(
+        "--demo-turns",
+        "--demo-reuse-turns",
+        dest="demo_turns",
+        type=int,
+        default=None,
+    )
     parser.add_argument("--demo-pause-seconds", type=float, default=None)
+    parser.add_argument("--demo-show-text", action="store_true")
+    parser.add_argument("--demo-prompt-preview-chars", type=int, default=160)
+    parser.add_argument("--demo-answer-preview-chars", type=int, default=120)
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--aligned-prompts", action="store_true")
     parser.add_argument("--exact-only", action="store_true")
@@ -609,6 +681,10 @@ def main() -> int:
             )
             prompt_exact_tokens = tokenizer.encode(prompt_exact_input)
             prompt_partial_tokens = tokenizer.encode(prompt_partial_input)
+        prompt_preview = _preview_text(
+            tokenizer.decode(prompt_exact_tokens),
+            args.demo_prompt_preview_chars,
+        )
     finally:
         probe_llm.llm_engine.engine_core.shutdown()
 
@@ -678,6 +754,8 @@ def main() -> int:
                 block_size=block_size,
                 max_new_tokens=args.max_new_tokens,
                 live_output_style=args.live_output_style,
+                prompt_preview=prompt_preview if args.demo_show_text else None,
+                answer_preview_chars=args.demo_answer_preview_chars,
             )
             exact_cold_runs = [live_demo["warm_baseline"]]
             exact_reuse_runs = list(live_demo["reuse_runs"])
@@ -792,10 +870,12 @@ def main() -> int:
             "aligned_prompts": args.aligned_prompts,
             "exact_only": args.exact_only,
             "demo_mode": args.demo_mode,
-            "demo_profile": resolved_demo_settings["profile"],
             "demo_overrides": resolved_demo_settings["overrides"],
             "warmup_runs": args.warmup_runs,
             "live_output_style": args.live_output_style,
+            "demo_show_text": args.demo_show_text,
+            "demo_prompt_preview_chars": args.demo_prompt_preview_chars,
+            "demo_answer_preview_chars": args.demo_answer_preview_chars,
             "sleep_between_live_lines": args.sleep_between_live_lines,
             "fit_prompt_in_single_prefill": args.fit_prompt_in_single_prefill,
             "block_size": block_size,

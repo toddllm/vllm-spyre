@@ -287,3 +287,19 @@ def extract_output_token_count(outputs: list[Any]) -> int:
         return 0
 
     return len(token_ids)
+
+
+def extract_output_text(outputs: list[Any]) -> str:
+    if not outputs:
+        return ""
+
+    request_output = outputs[0]
+    candidates = getattr(request_output, "outputs", None)
+    if not candidates:
+        return ""
+
+    text = getattr(candidates[0], "text", None)
+    if not isinstance(text, str):
+        return ""
+
+    return text
