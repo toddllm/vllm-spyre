@@ -99,6 +99,67 @@ def build_prompt(tokenizer, min_tokens: int, tail: str) -> str:
     return prompt + tail
 
 
+def round_down_to_block(tokens: int, block_size: int) -> int:
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    return max(0, (tokens // block_size) * block_size)
+
+
+def build_token_sequence(tokenizer, num_tokens: int, seed_text: str) -> list[int]:
+    if num_tokens < 0:
+        raise ValueError("num_tokens must be non-negative")
+    if num_tokens == 0:
+        return []
+
+    seed_ids = list(tokenizer.encode(seed_text, add_special_tokens=False))
+    special_ids = set(getattr(tokenizer, "all_special_ids", ()))
+    seed_ids = [token_id for token_id in seed_ids if token_id not in special_ids]
+    if not seed_ids:
+        raise ValueError("seed_text must tokenize to at least one non-special token")
+
+    repeats, remainder = divmod(num_tokens, len(seed_ids))
+    return seed_ids * repeats + seed_ids[:remainder]
+
+
+def build_aligned_reuse_token_prompts(
+    tokenizer,
+    *,
+    requested_shared_prefix_tokens: int,
+    block_size: int,
+    partial_tail_tokens: int,
+) -> dict[str, Any]:
+    aligned_shared_prefix_tokens = round_down_to_block(
+        requested_shared_prefix_tokens,
+        block_size,
+    )
+    if aligned_shared_prefix_tokens == 0:
+        aligned_shared_prefix_tokens = block_size
+
+    shared_prefix_ids = build_token_sequence(
+        tokenizer,
+        aligned_shared_prefix_tokens,
+        " Spyre KV aligned shared prefix.",
+    )
+    partial_tail_ids = build_token_sequence(
+        tokenizer,
+        max(0, partial_tail_tokens),
+        " Divergent partial tail for KV reuse demo.",
+    )
+
+    prefill_prompt_ids = list(shared_prefix_ids)
+    partial_prompt_ids = list(shared_prefix_ids) + list(partial_tail_ids)
+
+    return {
+        "requested_shared_prefix_tokens": requested_shared_prefix_tokens,
+        "aligned_shared_prefix_tokens": aligned_shared_prefix_tokens,
+        "prefill_prompt_token_ids": prefill_prompt_ids,
+        "partial_prompt_token_ids": partial_prompt_ids,
+        "partial_tail_tokens": len(partial_tail_ids),
+        "exact_prompt_recompute_tokens": 0,
+        "partial_prompt_recompute_tokens": len(partial_tail_ids),
+    }
+
+
 def common_prefix_len(a: list[int], b: list[int]) -> int:
     matched = 0
     for lhs, rhs in zip(a, b):

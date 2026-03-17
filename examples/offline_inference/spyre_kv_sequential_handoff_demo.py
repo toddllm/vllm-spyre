@@ -10,27 +10,33 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from typing import Any
 
 from spyre_kv_reuse_common import (
-    build_prompt,
+    build_aligned_reuse_token_prompts,
     build_run_metadata,
     common_prefix_len,
     diff_counts,
     drain_scheduler_stats,
+    extract_output_token_count,
     get_worker_probe_state,
     set_local_dist_defaults,
 )
 
 
-def _run_once(llm, prompt: str, sampling_params, label: str) -> dict[str, Any]:
+def _run_once(llm, prompt_input, sampling_params, label: str) -> dict[str, Any]:
     worker_before, store_before = get_worker_probe_state()
-    _ = llm.generate([prompt], sampling_params, use_tqdm=False)
+    start_t = time.perf_counter()
+    outputs = llm.generate([prompt_input], sampling_params, use_tqdm=False)
+    elapsed_s = time.perf_counter() - start_t
     scheduler_stats = drain_scheduler_stats(llm)
     worker_after, store_after = get_worker_probe_state()
 
     return {
         "label": label,
+        "request_elapsed_s": elapsed_s,
+        "output_tokens": extract_output_token_count(outputs),
         "scheduler_stats": scheduler_stats,
         "worker_delta": diff_counts(worker_after, worker_before),
         "store_before": store_before,
@@ -59,6 +65,7 @@ def main() -> int:
     parser.add_argument("--max-num-batched-tokens", type=int, default=128)
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--shared-prefix-tokens", type=int, default=192)
+    parser.add_argument("--partial-tail-tokens", type=int, default=16)
     parser.add_argument(
         "--decode-variant",
         choices=("exact", "partial"),
@@ -81,6 +88,7 @@ def main() -> int:
     vllm_spyre.register()
 
     from vllm import LLM, SamplingParams
+    from vllm.inputs import TokensPrompt
     from vllm_spyre.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector import (
         reset_global_store,
     )
@@ -113,27 +121,25 @@ def main() -> int:
         llm_kwargs["revision"] = args.revision
         llm_kwargs["tokenizer_revision"] = args.revision
 
+    llm_init_start_t = time.perf_counter()
     llm = LLM(**llm_kwargs)
+    llm_init_elapsed_s = time.perf_counter() - llm_init_start_t
 
     try:
         tokenizer = llm.get_tokenizer()
-        prompt_prefill = build_prompt(
+        block_size = int(llm.llm_engine.vllm_config.cache_config.block_size)
+        prompt_data = build_aligned_reuse_token_prompts(
             tokenizer,
-            args.shared_prefix_tokens,
-            tail="\n\nQuestion: Summarize the long prefix in one sentence.",
+            requested_shared_prefix_tokens=args.shared_prefix_tokens,
+            block_size=block_size,
+            partial_tail_tokens=args.partial_tail_tokens,
         )
-        prompt_partial = build_prompt(
-            tokenizer,
-            args.shared_prefix_tokens,
-            tail="\n\nQuestion: List three keywords from the long prefix.",
-        )
-        prompt_prefill_tokens = tokenizer.encode(prompt_prefill)
-        prompt_partial_tokens = tokenizer.encode(prompt_partial)
+        prompt_prefill_tokens = prompt_data["prefill_prompt_token_ids"]
+        prompt_partial_tokens = prompt_data["partial_prompt_token_ids"]
         common_prefix_tokens = common_prefix_len(
             prompt_prefill_tokens,
             prompt_partial_tokens,
         )
-        block_size = int(llm.llm_engine.vllm_config.cache_config.block_size)
 
         _ = drain_scheduler_stats(llm)
 
@@ -144,20 +150,28 @@ def main() -> int:
         )
 
         if args.role == "prefill":
-            result = _run_once(llm, prompt_prefill, sampling_params, "prefill_store")
+            result = _run_once(
+                llm,
+                TokensPrompt(prompt_token_ids=prompt_prefill_tokens),
+                sampling_params,
+                "prefill_store",
+            )
         else:
-            decode_prompt = (
-                prompt_prefill if args.decode_variant == "exact" else prompt_partial
+            decode_prompt_tokens = (
+                prompt_prefill_tokens
+                if args.decode_variant == "exact"
+                else prompt_partial_tokens
             )
             result = _run_once(
                 llm,
-                decode_prompt,
+                TokensPrompt(prompt_token_ids=decode_prompt_tokens),
                 sampling_params,
                 f"{args.decode_variant}_reuse",
             )
 
         summary = {
             "run_metadata": build_run_metadata(__file__),
+            "engine_init_elapsed_s": llm_init_elapsed_s,
             "role": args.role,
             "decode_variant": args.decode_variant if args.role == "decode" else None,
             "model": args.model,
@@ -169,7 +183,12 @@ def main() -> int:
             "block_size": block_size,
             "prefill_prompt_tokens": len(prompt_prefill_tokens),
             "partial_prompt_tokens": len(prompt_partial_tokens),
+            "requested_shared_prefix_tokens": prompt_data["requested_shared_prefix_tokens"],
+            "aligned_shared_prefix_tokens": prompt_data["aligned_shared_prefix_tokens"],
             "common_prefix_tokens": common_prefix_tokens,
+            "partial_tail_tokens": prompt_data["partial_tail_tokens"],
+            "exact_prompt_recompute_tokens": prompt_data["exact_prompt_recompute_tokens"],
+            "partial_prompt_recompute_tokens": prompt_data["partial_prompt_recompute_tokens"],
             "result": result,
         }
         print(json.dumps(summary, indent=2, sort_keys=True))
