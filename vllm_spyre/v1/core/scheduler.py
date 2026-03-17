@@ -360,23 +360,27 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
         if self.connector is None or not self.ongoing_prefills:
             return
 
-        cached_reqs = getattr(outputs, "scheduled_cached_reqs", None)
-        if cached_reqs is None:
+        scheduled_req_ids = set(getattr(outputs, "num_scheduled_tokens", {}).keys())
+        if not scheduled_req_ids:
             return
 
-        ongoing_prefill_ids = {req.request_id for req in self.ongoing_prefills}
-        for req_id in cached_reqs.req_ids:
-            if req_id in cached_reqs.resumed_req_ids:
-                continue
-            if req_id not in ongoing_prefill_ids:
+        for request in self.ongoing_prefills:
+            req_id = request.request_id
+            if req_id not in scheduled_req_ids:
                 continue
 
-            request = self.requests.get(req_id)
-            if request is None:
+            # The first chunk of a brand new prefill is already handled by the
+            # base scheduler's WAITING/PREEMPTED path. We only need to mirror
+            # subsequent RUNNING continuation chunks here.
+            if request.num_computed_tokens == 0:
+                continue
+
+            tracked_request = self.requests.get(req_id)
+            if tracked_request is None:
                 continue
 
             self.connector.update_state_after_alloc(
-                request,
+                tracked_request,
                 self.kv_cache_manager.get_blocks(req_id),
                 0,
             )
