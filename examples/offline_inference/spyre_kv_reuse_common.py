@@ -214,9 +214,9 @@ def resolve_demo_prompt_template(
         "instruction_text": resolved_instruction,
         "partial_tail_text": resolved_tail,
         "context_chunks": context_chunks,
-        "background_header_text": f"{INSTRUCTION_PROMPT_HEADER}\n\n### Background:\n",
-        "instruction_prefix_text": "\n\n### Instruction:\n",
-        "partial_tail_prefix_text": "\n\n### Extra detail to include:\n",
+        "instruction_header_text": f"{INSTRUCTION_PROMPT_HEADER}\n\n### Instruction:\n",
+        "partial_tail_intro_text": " Also include this detail: ",
+        "response_prefix_text": "\n\n### Response:",
     }
 
 
@@ -237,21 +237,16 @@ def build_templated_prompt(
         partial_tail_text=partial_tail_text,
     )
 
-    prompt = template["background_header_text"]
+    prompt = template["instruction_header_text"]
     context_idx = 0
     while len(tokenizer.encode(prompt)) < min_tokens:
         prompt += template["context_chunks"][context_idx % len(template["context_chunks"])]
         context_idx += 1
 
-    prompt += (
-        template["instruction_prefix_text"]
-        + template["instruction_text"]
-    )
+    prompt += template["instruction_text"]
     if include_partial_tail:
-        prompt += (
-            template["partial_tail_prefix_text"]
-            + template["partial_tail_text"]
-        )
+        prompt += template["partial_tail_intro_text"] + template["partial_tail_text"]
+    prompt += template["response_prefix_text"]
     return prompt
 
 
@@ -344,7 +339,7 @@ def build_aligned_reuse_token_prompts(
     header_ids = [
         token_id
         for token_id in tokenizer.encode(
-            template["background_header_text"],
+            template["instruction_header_text"],
             add_special_tokens=False,
         )
         if token_id not in special_ids
@@ -352,33 +347,52 @@ def build_aligned_reuse_token_prompts(
     instruction_ids = [
         token_id
         for token_id in tokenizer.encode(
-            template["instruction_prefix_text"] + template["instruction_text"],
+            template["instruction_text"],
             add_special_tokens=False,
         )
         if token_id not in special_ids
     ]
     if not instruction_ids:
         raise ValueError("instruction_text must tokenize to at least one non-special token")
+    response_prefix_ids = [
+        token_id
+        for token_id in tokenizer.encode(
+            template["response_prefix_text"],
+            add_special_tokens=False,
+        )
+        if token_id not in special_ids
+    ]
+    if not response_prefix_ids:
+        raise ValueError("response prefix must tokenize to at least one non-special token")
 
-    if len(header_ids) + len(instruction_ids) >= aligned_shared_prefix_tokens:
-        shared_prefix_ids = (header_ids + instruction_ids)[:aligned_shared_prefix_tokens]
+    shared_body_budget = max(
+        0,
+        aligned_shared_prefix_tokens - len(response_prefix_ids),
+    )
+
+    if len(header_ids) + len(instruction_ids) >= shared_body_budget:
+        shared_prompt_body_ids = (header_ids + instruction_ids)[:shared_body_budget]
     else:
-        context_budget = aligned_shared_prefix_tokens - len(header_ids) - len(instruction_ids)
+        context_budget = shared_body_budget - len(header_ids) - len(instruction_ids)
         context_ids = build_token_sequence_from_chunks(
             tokenizer,
             context_budget,
             template["context_chunks"],
         )
-        shared_prefix_ids = header_ids + context_ids + instruction_ids
+        shared_prompt_body_ids = header_ids + context_ids + instruction_ids
 
     partial_tail_ids = build_token_sequence(
         tokenizer,
         max(0, partial_tail_tokens),
-        template["partial_tail_prefix_text"] + template["partial_tail_text"],
+        template["partial_tail_intro_text"] + template["partial_tail_text"],
     )
 
-    prefill_prompt_ids = list(shared_prefix_ids)
-    partial_prompt_ids = list(shared_prefix_ids) + list(partial_tail_ids)
+    prefill_prompt_ids = list(shared_prompt_body_ids) + list(response_prefix_ids)
+    partial_prompt_ids = (
+        list(shared_prompt_body_ids)
+        + list(partial_tail_ids)
+        + list(response_prefix_ids)
+    )
 
     return {
         "demo_template": template["template_name"],
@@ -392,7 +406,7 @@ def build_aligned_reuse_token_prompts(
         "partial_prompt_token_ids": partial_prompt_ids,
         "partial_tail_tokens": len(partial_tail_ids),
         "exact_prompt_recompute_tokens": 0,
-        "partial_prompt_recompute_tokens": len(partial_tail_ids),
+        "partial_prompt_recompute_tokens": len(partial_tail_ids) + len(response_prefix_ids),
     }
 
 

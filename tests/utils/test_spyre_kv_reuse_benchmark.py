@@ -99,7 +99,7 @@ def test_format_live_header_demo_style_mentions_example_and_task():
 
     assert "Example: Chicken soup instructions" in lines
     assert "Task: Provide a list of instructions for preparing chicken soup." in lines
-    assert 'Prompt setup: "Below is an instruction..."' in lines
+    assert 'Prompt: "Below is an instruction..."' in lines
 
 
 def test_format_live_result_line_includes_cumulative_saved_time_when_provided():

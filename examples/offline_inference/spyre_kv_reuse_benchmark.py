@@ -175,7 +175,7 @@ def _format_live_header(
             ),
         ])
         if prompt_preview:
-            lines.append(f'Prompt setup: "{prompt_preview}"')
+            lines.append(f'Prompt: "{prompt_preview}"')
         lines.append("")
         return lines
 
@@ -736,8 +736,14 @@ def main() -> int:
             prompt_partial_tokens = tokenizer.encode(prompt_partial_input)
             prompt_label = resolved_template["display_name"]
             task_text = resolved_template["instruction_text"]
+        preview_source = task_text
+        if resolved_template.get("scenario_text"):
+            preview_source = (
+                f"{resolved_template['scenario_text']}. "
+                f"{task_text}"
+            )
         prompt_preview = _preview_text(
-            tokenizer.decode(prompt_exact_tokens),
+            preview_source,
             args.demo_prompt_preview_chars,
         )
     finally:
