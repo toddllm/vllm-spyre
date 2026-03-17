@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE: int = 1024
     VLLM_SPYRE_KV_STORE_BACKEND: str = "host_memory"
     VLLM_SPYRE_KV_STORE_MAX_BYTES: int = 0
+    VLLM_SPYRE_KV_SERVICE_SOCKET: str = "/tmp/spyre-kv-persistent.sock"
 
 logger = init_logger(__name__)
 
@@ -152,6 +153,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   reconstruct tensors on load to better approximate a transport step
     # - "serialized_shared_memory": store serialized CPU payload bytes in
     #   named shared-memory segments and map them on load
+    # - "serialized_shared_memory_service": store serialized CPU payload bytes
+    #   in named shared-memory segments owned by a long-lived local service
     # - "serialized_uds_process_store": store serialized CPU payload bytes in
     #   a local subprocess reached over a Unix domain socket
     "VLLM_SPYRE_KV_STORE_BACKEND": lambda: os.getenv(
@@ -161,6 +164,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # size and relies only on the saved-request registry cap.
     "VLLM_SPYRE_KV_STORE_MAX_BYTES": lambda: int(
         os.getenv("VLLM_SPYRE_KV_STORE_MAX_BYTES", "0")
+    ),
+    # Socket path for the persistent local KV service. Only used with the
+    # serialized_shared_memory_service backend.
+    "VLLM_SPYRE_KV_SERVICE_SOCKET": lambda: os.getenv(
+        "VLLM_SPYRE_KV_SERVICE_SOCKET", "/tmp/spyre-kv-persistent.sock"
     ),
 }
 # --8<-- [end:env-vars-definition]

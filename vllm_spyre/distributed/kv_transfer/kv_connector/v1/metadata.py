@@ -5,7 +5,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 import io
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker, shared_memory
 from typing import Any
 
 import torch
@@ -18,6 +18,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 )
 from vllm_spyre.distributed.kv_transfer.kv_connector.v1.local_transport_store import (
     UDSProcessKVTransport,
+)
+from vllm_spyre.distributed.kv_transfer.kv_connector.v1.persistent_kv_service import (
+    PersistentKVServiceClient,
 )
 
 
@@ -148,6 +151,26 @@ class SpyreKVStoreBackend(ABC):
     @abstractmethod
     def stats(self) -> dict[str, Any]: ...
 
+    def has_persistent_saved_requests(self) -> bool:
+        return False
+
+    def save_request_record(self, record: SavedRequestRecord) -> None:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support persistent saved requests"
+        )
+
+    def get_saved_requests(self) -> list[SavedRequestRecord]:
+        return []
+
+    def remove_saved_request(self, req_id: str) -> bool:
+        return False
+
+    def clear_saved_requests(self) -> None:
+        return
+
+    def saved_request_count(self) -> int:
+        return 0
+
 
 @dataclass
 class SpyreConnectorRequestMeta:
@@ -157,6 +180,14 @@ class SpyreConnectorRequestMeta:
     token_count: int = 0
     source_req_id: str = ""
     block_mapping: list[tuple[int, int]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SavedRequestRecord:
+    req_id: str
+    prompt_token_ids: tuple[int, ...]
+    block_ids: list[int]
+    num_tokens: int
 
 
 @dataclass
@@ -678,6 +709,21 @@ class SerializedSharedMemoryKVStoreBackend(SpyreKVStoreBackend):
             return None
 
         try:
+            # This process is only attaching to a segment owned by the service.
+            # Unregister the attachment so Python does not try to unlink it again
+            # at interpreter shutdown.
+            for tracker_name in {
+                str(entry.shm_name),
+                str(getattr(shm, "_name", entry.shm_name)),
+            }:
+                try:
+                    resource_tracker.unregister(tracker_name, "shared_memory")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
             return bytes(shm.buf[: entry.payload_size])
         finally:
             shm.close()
@@ -835,6 +881,177 @@ class SerializedSharedMemoryKVStoreBackend(SpyreKVStoreBackend):
             "max_bytes": self._max_bytes,
             "evictions": self._evictions,
         }
+
+
+class SerializedSharedMemoryServiceKVStoreBackend(SpyreKVStoreBackend):
+    def __init__(
+        self,
+        max_bytes: int = 0,
+        *,
+        socket_path: str = "/tmp/spyre-kv-persistent.sock",
+        max_saved_requests: int = 1024,
+    ) -> None:
+        self._socket_path = socket_path
+        self._client = PersistentKVServiceClient(socket_path)
+        self._client.configure(
+            max_bytes=max(0, max_bytes),
+            max_saved_requests=max(0, max_saved_requests),
+        )
+
+    @property
+    def backend_name(self) -> str:
+        return "serialized_shared_memory_service"
+
+    def has_persistent_saved_requests(self) -> bool:
+        return True
+
+    @property
+    def size(self) -> int:
+        return int(self.stats().get("total_entries", 0))
+
+    @property
+    def current_bytes(self) -> int:
+        return int(self.stats().get("memory_estimate_bytes", 0))
+
+    @property
+    def max_bytes(self) -> int:
+        return int(self.stats().get("max_bytes", 0))
+
+    @property
+    def evictions(self) -> int:
+        return int(self.stats().get("evictions", 0))
+
+    @staticmethod
+    def _serialize_tensor(data: torch.Tensor) -> bytes:
+        buffer = io.BytesIO()
+        torch.save(data.detach().clone().cpu(), buffer)
+        return buffer.getvalue()
+
+    @staticmethod
+    def _materialize_tensor(payload: bytes) -> torch.Tensor:
+        buffer = io.BytesIO(payload)
+        return torch.load(buffer, map_location="cpu", weights_only=True)
+
+    @staticmethod
+    def _normalize_entry(entry: dict[str, Any]) -> SerializedSharedMemoryKVEntry:
+        return SerializedSharedMemoryKVEntry(
+            shm_name=str(entry["shm_name"]),
+            payload_size=int(entry["payload_size"]),
+            dtype=str(entry["dtype"]),
+            shape=tuple(entry["shape"]),
+            version=int(entry.get("version", 1)),
+            source_req=str(entry.get("source_req", "")),
+        )
+
+    @staticmethod
+    def _read_payload(entry: SerializedSharedMemoryKVEntry) -> bytes | None:
+        try:
+            shm = shared_memory.SharedMemory(name=entry.shm_name, create=False)
+        except FileNotFoundError:
+            return None
+
+        try:
+            return bytes(shm.buf[: entry.payload_size])
+        finally:
+            shm.close()
+
+    @staticmethod
+    def _normalize_saved_request(record: Any) -> SavedRequestRecord:
+        if isinstance(record, SavedRequestRecord):
+            return record
+        if isinstance(record, dict):
+            return SavedRequestRecord(
+                req_id=str(record["req_id"]),
+                prompt_token_ids=tuple(record["prompt_token_ids"]),
+                block_ids=list(record["block_ids"]),
+                num_tokens=int(record["num_tokens"]),
+            )
+        raise TypeError(f"Unsupported saved request record type: {type(record)!r}")
+
+    def put(
+        self,
+        key: StoreKey,
+        data: torch.Tensor,
+        source_req: str = "",
+    ) -> tuple[int, bool]:
+        payload = self._serialize_tensor(data)
+        return self._client.put(
+            key,
+            payload,
+            str(data.dtype),
+            tuple(data.shape),
+            source_req=source_req,
+        )
+
+    def get(self, key: StoreKey) -> HostMemoryKVEntry | None:
+        entry_dict = self._client.get_entry(key)
+        if entry_dict is None:
+            return None
+
+        entry = self._normalize_entry(entry_dict)
+        payload = self._read_payload(entry)
+        if payload is None:
+            return None
+
+        return HostMemoryKVEntry(
+            data=self._materialize_tensor(payload),
+            dtype=entry.dtype,
+            shape=entry.shape,
+            version=entry.version,
+            source_req=entry.source_req,
+        )
+
+    def load_into(self, key: StoreKey, dest: torch.Tensor) -> bool:
+        entry_dict = self._client.get_entry(key)
+        if entry_dict is None:
+            return False
+
+        entry = self._normalize_entry(entry_dict)
+        payload = self._read_payload(entry)
+        if payload is None:
+            return False
+
+        try:
+            dest.copy_(self._materialize_tensor(payload))
+        except RuntimeError:
+            return False
+        return True
+
+    def contains(self, key: StoreKey) -> bool:
+        return self._client.contains(key)
+
+    def available_prefix_blocks(self, req_id: str, block_ids: list[int]) -> int:
+        return self._client.available_prefix_blocks(req_id, block_ids)
+
+    def remove_by_req(self, req_id: str) -> int:
+        return self._client.remove_by_req(req_id)
+
+    def clear(self) -> None:
+        self._client.clear()
+
+    def shutdown(self) -> None:
+        self._client.close()
+
+    def stats(self) -> dict[str, Any]:
+        return self._client.stats()
+
+    def save_request_record(self, record: SavedRequestRecord) -> None:
+        self._client.save_request_record(record)
+
+    def get_saved_requests(self) -> list[SavedRequestRecord]:
+        return [
+            self._normalize_saved_request(record)
+            for record in self._client.get_saved_requests()
+        ]
+
+    def remove_saved_request(self, req_id: str) -> bool:
+        return self._client.remove_saved_request(req_id)
+
+    def clear_saved_requests(self) -> None:
+        self._client.clear_saved_requests()
+
+    def saved_request_count(self) -> int:
+        return int(self.stats().get("saved_requests_count", 0))
 
 
 class SerializedUDSProcessKVStoreBackend(SpyreKVStoreBackend):
@@ -1041,6 +1258,7 @@ _STORE_BACKEND_TYPES: dict[str, type[SpyreKVStoreBackend]] = {
     "host_memory": HostMemoryKVStoreBackend,
     "serialized_host_memory": SerializedHostMemoryKVStoreBackend,
     "serialized_shared_memory": SerializedSharedMemoryKVStoreBackend,
+    "serialized_shared_memory_service": SerializedSharedMemoryServiceKVStoreBackend,
     "serialized_uds_process_store": SerializedUDSProcessKVStoreBackend,
 }
 
@@ -1049,6 +1267,8 @@ def build_spyre_kv_store_backend(
     backend_name: str,
     *,
     max_bytes: int = 0,
+    max_saved_requests: int = 1024,
+    service_socket: str | None = None,
 ) -> SpyreKVStoreBackend:
     backend_key = backend_name.strip().lower()
     backend_type = _STORE_BACKEND_TYPES.get(backend_key)
@@ -1056,6 +1276,12 @@ def build_spyre_kv_store_backend(
         supported = ", ".join(sorted(_STORE_BACKEND_TYPES))
         raise ValueError(
             f"Unknown Spyre KV store backend '{backend_name}'. Supported backends: {supported}"
+        )
+    if backend_key == "serialized_shared_memory_service":
+        return backend_type(
+            max_bytes=max_bytes,
+            socket_path=service_socket or "/tmp/spyre-kv-persistent.sock",
+            max_saved_requests=max_saved_requests,
         )
     return backend_type(max_bytes=max_bytes)
 

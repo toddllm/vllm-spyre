@@ -5,7 +5,9 @@ from vllm_spyre.distributed.kv_transfer.kv_connector.v1.metadata import (
     HostMemoryKVStoreBackend,
     InMemoryKVStore,
     KVKind,
+    SavedRequestRecord,
     SerializedSharedMemoryKVStoreBackend,
+    SerializedSharedMemoryServiceKVStoreBackend,
     SerializedUDSProcessKVStoreBackend,
     SerializedHostMemoryKVStoreBackend,
     SpyreConnectorMeta,
@@ -14,13 +16,20 @@ from vllm_spyre.distributed.kv_transfer.kv_connector.v1.metadata import (
     StoreKey,
     build_spyre_kv_store_backend,
 )
+from vllm_spyre.distributed.kv_transfer.kv_connector.v1.persistent_kv_service import (
+    PersistentKVServiceClient,
+    run_persistent_kv_service,
+)
 
 __all__ = [
     "HostMemoryKVStoreBackend",
     "InMemoryKVStore",
     "InMemorySpyreConnector",
     "KVKind",
+    "PersistentKVServiceClient",
+    "SavedRequestRecord",
     "SerializedSharedMemoryKVStoreBackend",
+    "SerializedSharedMemoryServiceKVStoreBackend",
     "SerializedUDSProcessKVStoreBackend",
     "SerializedHostMemoryKVStoreBackend",
     "SpyreConnectorMeta",
@@ -28,4 +37,5 @@ __all__ = [
     "SpyreKVStoreBackend",
     "StoreKey",
     "build_spyre_kv_store_backend",
+    "run_persistent_kv_service",
 ]

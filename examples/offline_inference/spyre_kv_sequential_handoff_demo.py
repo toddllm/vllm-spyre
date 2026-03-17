@@ -1,12 +1,8 @@
 """
-Probe request-granular KV store eviction under the current Spyre connector path.
+Sequential prefill/decode handoff demo for the Spyre KV connector.
 
-This intentionally stays narrow:
-- `InMemorySpyreConnector`
-- configurable store backend under the connector
-- request-granular store pressure via `VLLM_SPYRE_KV_STORE_MAX_BYTES`
-- single-process (`VLLM_ENABLE_V1_MULTIPROCESSING=0`)
-- built-in prefix caching disabled, so any reuse comes from the connector path
+This keeps one AIU-owning process at a time while persisting KV state and
+saved-request metadata in a long-lived node-local service.
 """
 
 from __future__ import annotations
@@ -17,7 +13,9 @@ import os
 from typing import Any
 
 from spyre_kv_reuse_common import (
+    build_prompt,
     build_run_metadata,
+    common_prefix_len,
     diff_counts,
     drain_scheduler_stats,
     get_worker_probe_state,
@@ -25,22 +23,12 @@ from spyre_kv_reuse_common import (
 )
 
 
-def _build_distinct_prompt(tokenizer, min_tokens: int, label: str, tail: str) -> str:
-    base = (
-        f"Spyre KV eviction probe for request family {label}. "
-        f"This prompt intentionally repeats a distinct family marker for {label}. "
-    )
-    prompt = base
-    while len(tokenizer.encode(prompt)) < min_tokens:
-        prompt += base
-    return prompt + tail
-
-
 def _run_once(llm, prompt: str, sampling_params, label: str) -> dict[str, Any]:
     worker_before, store_before = get_worker_probe_state()
     _ = llm.generate([prompt], sampling_params, use_tqdm=False)
     scheduler_stats = drain_scheduler_stats(llm)
     worker_after, store_after = get_worker_probe_state()
+
     return {
         "label": label,
         "scheduler_stats": scheduler_stats,
@@ -52,6 +40,7 @@ def _run_once(llm, prompt: str, sampling_params, label: str) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--role", choices=("prefill", "decode"), required=True)
     parser.add_argument(
         "--model",
         type=str,
@@ -59,24 +48,32 @@ def main() -> int:
     )
     parser.add_argument("--revision", type=str, default=None)
     parser.add_argument("--backend", type=str, default="sendnn")
-    parser.add_argument("--store-backend", type=str, default="host_memory")
-    parser.add_argument("--service-socket", type=str, default=None)
-    parser.add_argument("--store-max-bytes", type=int, default=4_500_000)
+    parser.add_argument(
+        "--service-socket",
+        type=str,
+        default="/tmp/spyre-kv-persistent.sock",
+    )
+    parser.add_argument("--store-max-bytes", type=int, default=0)
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--max-num-seqs", type=int, default=4)
     parser.add_argument("--max-num-batched-tokens", type=int, default=128)
     parser.add_argument("--max-new-tokens", type=int, default=8)
-    parser.add_argument("--prompt-min-tokens", type=int, default=192)
-    parser.add_argument("--no-assert-eviction", action="store_true")
+    parser.add_argument("--shared-prefix-tokens", type=int, default=192)
+    parser.add_argument(
+        "--decode-variant",
+        choices=("exact", "partial"),
+        default="exact",
+    )
+    parser.add_argument("--clear-service", action="store_true")
+    parser.add_argument("--no-assert-reuse", action="store_true")
     args = parser.parse_args()
 
     os.environ.setdefault("VLLM_SPYRE_DYNAMO_BACKEND", args.backend)
     os.environ.setdefault("VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE", "1")
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-    os.environ["VLLM_SPYRE_KV_STORE_BACKEND"] = args.store_backend
+    os.environ["VLLM_SPYRE_KV_STORE_BACKEND"] = "serialized_shared_memory_service"
     os.environ["VLLM_SPYRE_KV_STORE_MAX_BYTES"] = str(args.store_max_bytes)
-    if args.service_socket:
-        os.environ["VLLM_SPYRE_KV_SERVICE_SOCKET"] = args.service_socket
+    os.environ["VLLM_SPYRE_KV_SERVICE_SOCKET"] = args.service_socket
     set_local_dist_defaults()
 
     import vllm_spyre
@@ -87,8 +84,18 @@ def main() -> int:
     from vllm_spyre.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector import (
         reset_global_store,
     )
+    from vllm_spyre.distributed.kv_transfer.kv_connector.v1.persistent_kv_service import (
+        PersistentKVServiceClient,
+    )
 
-    reset_global_store(args.store_backend)
+    if args.clear_service:
+        client = PersistentKVServiceClient(args.service_socket)
+        try:
+            client.clear()
+        finally:
+            client.close()
+
+    reset_global_store("serialized_shared_memory_service")
 
     llm_kwargs: dict[str, Any] = {
         "model": args.model,
@@ -110,21 +117,22 @@ def main() -> int:
 
     try:
         tokenizer = llm.get_tokenizer()
-        prompt_a = _build_distinct_prompt(
+        prompt_prefill = build_prompt(
             tokenizer,
-            args.prompt_min_tokens,
-            label="alpha",
-            tail="\n\nQuestion: Summarize the alpha family prompt in one sentence.",
+            args.shared_prefix_tokens,
+            tail="\n\nQuestion: Summarize the long prefix in one sentence.",
         )
-        prompt_b = _build_distinct_prompt(
+        prompt_partial = build_prompt(
             tokenizer,
-            args.prompt_min_tokens,
-            label="beta",
-            tail="\n\nQuestion: Summarize the beta family prompt in one sentence.",
+            args.shared_prefix_tokens,
+            tail="\n\nQuestion: List three keywords from the long prefix.",
         )
-
-        prompt_a_tokens = tokenizer.encode(prompt_a)
-        prompt_b_tokens = tokenizer.encode(prompt_b)
+        prompt_prefill_tokens = tokenizer.encode(prompt_prefill)
+        prompt_partial_tokens = tokenizer.encode(prompt_partial)
+        common_prefix_tokens = common_prefix_len(
+            prompt_prefill_tokens,
+            prompt_partial_tokens,
+        )
         block_size = int(llm.llm_engine.vllm_config.cache_config.block_size)
 
         _ = drain_scheduler_stats(llm)
@@ -135,40 +143,49 @@ def main() -> int:
             ignore_eos=True,
         )
 
-        warm_a = _run_once(llm, prompt_a, sampling_params, "warm_a")
-        warm_b = _run_once(llm, prompt_b, sampling_params, "warm_b")
-        replay_a = _run_once(llm, prompt_a, sampling_params, "replay_a_after_eviction")
+        if args.role == "prefill":
+            result = _run_once(llm, prompt_prefill, sampling_params, "prefill_store")
+        else:
+            decode_prompt = (
+                prompt_prefill if args.decode_variant == "exact" else prompt_partial
+            )
+            result = _run_once(
+                llm,
+                decode_prompt,
+                sampling_params,
+                f"{args.decode_variant}_reuse",
+            )
 
         summary = {
             "run_metadata": build_run_metadata(__file__),
+            "role": args.role,
+            "decode_variant": args.decode_variant if args.role == "decode" else None,
             "model": args.model,
             "revision": args.revision,
             "backend": args.backend,
-            "store_backend": args.store_backend,
+            "store_backend": "serialized_shared_memory_service",
             "service_socket": args.service_socket,
             "store_max_bytes": args.store_max_bytes,
             "block_size": block_size,
-            "prompt_a_tokens": len(prompt_a_tokens),
-            "prompt_b_tokens": len(prompt_b_tokens),
-            "warm_a": warm_a,
-            "warm_b": warm_b,
-            "replay_a_after_eviction": replay_a,
+            "prefill_prompt_tokens": len(prompt_prefill_tokens),
+            "partial_prompt_tokens": len(prompt_partial_tokens),
+            "common_prefix_tokens": common_prefix_tokens,
+            "result": result,
         }
         print(json.dumps(summary, indent=2, sort_keys=True))
 
-        if not args.no_assert_eviction:
-            if warm_a["worker_delta"].get("blocks_saved", 0) <= 0:
-                raise SystemExit("Eviction probe failed: warm_a did not save any connector entries.")
-            if warm_b["worker_delta"].get("blocks_saved", 0) <= 0:
-                raise SystemExit("Eviction probe failed: warm_b did not save any connector entries.")
-            if warm_b["store_after"].get("evictions", 0) <= warm_a["store_after"].get("evictions", 0):
-                raise SystemExit("Eviction probe failed: warm_b did not trigger store eviction.")
-            if replay_a["worker_delta"].get("blocks_loaded", 0) != 0:
-                raise SystemExit("Eviction probe failed: replay_a unexpectedly loaded evicted blocks.")
-            if replay_a["worker_delta"].get("blocks_missing", 0) != 0:
-                raise SystemExit("Eviction probe failed: replay_a hit load misses instead of clean fallback.")
-            if replay_a["worker_delta"].get("blocks_saved", 0) <= 0:
-                raise SystemExit("Eviction probe failed: replay_a did not fall back to saving the request again.")
+        if args.role == "prefill":
+            if result["worker_delta"].get("blocks_saved", 0) <= 0:
+                raise SystemExit(
+                    "Sequential handoff prefill failed: request did not save connector entries."
+                )
+        elif not args.no_assert_reuse:
+            loaded = result["worker_delta"].get("blocks_loaded", 0)
+            missing = result["worker_delta"].get("blocks_missing", 0)
+            if loaded <= 0 or missing > 0:
+                raise SystemExit(
+                    "Sequential handoff decode failed: request did not reuse connector entries."
+                )
 
         return 0
     finally:

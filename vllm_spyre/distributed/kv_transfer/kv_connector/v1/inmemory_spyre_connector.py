@@ -20,6 +20,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 
 from vllm_spyre.distributed.kv_transfer.kv_connector.v1.metadata import (
     KVKind,
+    SavedRequestRecord,
     SpyreConnectorMeta,
     SpyreConnectorRequestMeta,
     SpyreConnectorStats,
@@ -46,6 +47,8 @@ def _build_configured_store(store_backend_name: str | None = None) -> SpyreKVSto
     return build_spyre_kv_store_backend(
         backend_name,
         max_bytes=envs_spyre.VLLM_SPYRE_KV_STORE_MAX_BYTES,
+        max_saved_requests=envs_spyre.VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE,
+        service_socket=envs_spyre.VLLM_SPYRE_KV_SERVICE_SOCKET,
     )
 
 
@@ -64,16 +67,8 @@ def reset_global_store(store_backend_name: str | None = None) -> None:
 
 
 @dataclass(frozen=True)
-class _SavedRequest:
-    req_id: str
-    prompt_token_ids: tuple[int, ...]
-    block_ids: list[int]
-    num_tokens: int
-
-
-@dataclass(frozen=True)
 class _PendingLoadSource:
-    source: _SavedRequest
+    source: SavedRequestRecord
     matched_tokens_total: int
     num_local_computed_tokens: int
 
@@ -96,7 +91,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         self._store = store if store is not None else get_global_store()
 
         self._pending_requests: list[SpyreConnectorRequestMeta] = []
-        self._saved_requests: OrderedDict[str, _SavedRequest] = OrderedDict()
+        self._saved_requests: OrderedDict[str, SavedRequestRecord] = OrderedDict()
         self._saved_requests_max_size = envs_spyre.VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE
         self._pending_load_sources: dict[str, _PendingLoadSource] = {}
 
@@ -116,10 +111,50 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         self._stats = SpyreConnectorStats()
 
     def _prune_saved_request(self, req_id: str, *, remove_store: bool = False) -> bool:
-        removed = self._saved_requests.pop(req_id, None) is not None
+        if self._store.has_persistent_saved_requests():
+            removed = self._store.remove_saved_request(req_id)
+        else:
+            removed = self._saved_requests.pop(req_id, None) is not None
         if remove_store:
             self._store.remove_by_req(req_id)
         return removed
+
+    def _load_saved_requests(self) -> list[SavedRequestRecord]:
+        if not self._store.has_persistent_saved_requests():
+            return list(self._saved_requests.values())
+
+        records = [
+            SavedRequestRecord(
+                req_id=str(record.req_id),
+                prompt_token_ids=tuple(record.prompt_token_ids),
+                block_ids=list(record.block_ids),
+                num_tokens=int(record.num_tokens),
+            )
+            for record in self._store.get_saved_requests()
+        ]
+        self._saved_requests = OrderedDict((record.req_id, record) for record in records)
+        return records
+
+    def _save_request_record(self, record: SavedRequestRecord) -> None:
+        if self._store.has_persistent_saved_requests():
+            self._store.save_request_record(record)
+            self._load_saved_requests()
+            return
+
+        if record.req_id in self._saved_requests:
+            self._saved_requests.move_to_end(record.req_id)
+        self._saved_requests[record.req_id] = record
+
+        if self._saved_requests_max_size > 0:
+            while len(self._saved_requests) > self._saved_requests_max_size:
+                oldest_req_id, _ = self._saved_requests.popitem(last=False)
+                self._store.remove_by_req(oldest_req_id)
+                self._stats.record("evictions")
+
+    def _saved_request_count(self) -> int:
+        if self._store.has_persistent_saved_requests():
+            return self._store.saved_request_count()
+        return len(self._saved_requests)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         self._kv_caches = kv_caches
@@ -287,17 +322,18 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
         prompt = request.prompt_token_ids
-        if not prompt or not self._saved_requests:
+        saved_requests = self._load_saved_requests()
+        if not prompt or not saved_requests:
             self._pending_load_sources.pop(request.request_id, None)
             self._stats.record("match_attempts")
             return 0, False
 
         prompt_tuple = tuple(prompt)
-        best_match: _SavedRequest | None = None
+        best_match: SavedRequestRecord | None = None
         best_tokens_total = 0
         stale_request_ids: list[str] = []
 
-        for saved in self._saved_requests.values():
+        for saved in saved_requests:
             saved_len = len(saved.prompt_token_ids)
             if saved_len == 0:
                 continue
@@ -322,7 +358,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                 best_match = saved
 
         for req_id in stale_request_ids:
-            self._prune_saved_request(req_id)
+            self._prune_saved_request(req_id, remove_store=True)
 
         if best_match is None or best_tokens_total == 0:
             self._pending_load_sources.pop(request.request_id, None)
@@ -443,21 +479,13 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                 self._store.remove_by_req(request.request_id)
                 return False, None
 
-            saved = _SavedRequest(
+            saved = SavedRequestRecord(
                 req_id=request.request_id,
                 prompt_token_ids=tuple(prompt),
                 block_ids=list(block_ids),
                 num_tokens=len(prompt),
             )
-            if request.request_id in self._saved_requests:
-                self._saved_requests.move_to_end(request.request_id)
-            self._saved_requests[request.request_id] = saved
-
-            if self._saved_requests_max_size > 0:
-                while len(self._saved_requests) > self._saved_requests_max_size:
-                    oldest_req_id, _ = self._saved_requests.popitem(last=False)
-                    self._store.remove_by_req(oldest_req_id)
-                    self._stats.record("evictions")
+            self._save_request_record(saved)
 
         return False, None
 
@@ -481,7 +509,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             "blocks_saved": self._blocks_saved,
             "blocks_loaded": self._blocks_loaded,
             "blocks_missing": self._blocks_missing,
-            "saved_requests_count": len(self._saved_requests),
+            "saved_requests_count": self._saved_request_count(),
         }
 
     def get_store(self) -> SpyreKVStoreBackend:
@@ -501,7 +529,12 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         self._load_error_block_ids.clear()
 
         if clear_saved_requests:
-            self._saved_requests.clear()
+            if self._store.has_persistent_saved_requests():
+                self._saved_requests.clear()
+                if not clear_store:
+                    self._store.clear_saved_requests()
+            else:
+                self._saved_requests.clear()
 
         if clear_metrics:
             self._blocks_saved = 0
