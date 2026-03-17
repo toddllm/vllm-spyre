@@ -105,6 +105,14 @@ def round_down_to_block(tokens: int, block_size: int) -> int:
     return max(0, (tokens // block_size) * block_size)
 
 
+def round_up_to_block(tokens: int, block_size: int) -> int:
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    if tokens <= 0:
+        return 0
+    return ((tokens + block_size - 1) // block_size) * block_size
+
+
 def build_token_sequence(tokenizer, num_tokens: int, seed_text: str) -> list[int]:
     if num_tokens < 0:
         raise ValueError("num_tokens must be non-negative")

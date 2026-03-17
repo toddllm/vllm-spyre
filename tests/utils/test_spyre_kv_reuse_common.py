@@ -11,6 +11,7 @@ from spyre_kv_reuse_common import (
     build_aligned_reuse_token_prompts,
     build_token_sequence,
     round_down_to_block,
+    round_up_to_block,
 )
 
 
@@ -30,6 +31,13 @@ def test_round_down_to_block():
     assert round_down_to_block(63, 64) == 0
     assert round_down_to_block(64, 64) == 64
     assert round_down_to_block(129, 64) == 128
+
+
+def test_round_up_to_block():
+    assert round_up_to_block(0, 64) == 0
+    assert round_up_to_block(1, 64) == 64
+    assert round_up_to_block(64, 64) == 64
+    assert round_up_to_block(129, 64) == 192
 
 
 def test_build_token_sequence_returns_exact_token_count():
@@ -66,3 +74,8 @@ def test_build_aligned_reuse_token_prompts_produces_exact_reuse_case():
 def test_round_down_to_block_rejects_non_positive_block_size():
     with pytest.raises(ValueError, match="block_size must be positive"):
         round_down_to_block(128, 0)
+
+
+def test_round_up_to_block_rejects_non_positive_block_size():
+    with pytest.raises(ValueError, match="block_size must be positive"):
+        round_up_to_block(128, 0)

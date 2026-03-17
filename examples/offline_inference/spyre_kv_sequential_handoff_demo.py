@@ -22,6 +22,7 @@ from spyre_kv_reuse_common import (
     extract_output_token_count,
     get_worker_probe_state,
     round_down_to_block,
+    round_up_to_block,
     set_local_dist_defaults,
 )
 
@@ -118,9 +119,13 @@ def main() -> int:
     planned_partial_prompt_tokens = (
         planned_aligned_shared_prefix_tokens + max(0, args.partial_tail_tokens)
     )
-    effective_max_num_batched_tokens = max(
+    requested_max_num_batched_tokens = max(
         args.max_num_batched_tokens,
         planned_partial_prompt_tokens,
+    )
+    effective_max_num_batched_tokens = round_up_to_block(
+        requested_max_num_batched_tokens,
+        SPYRE_DEMO_BLOCK_SIZE,
     )
 
     llm_kwargs: dict[str, Any] = {
@@ -203,7 +208,7 @@ def main() -> int:
             "service_socket": args.service_socket,
             "store_max_bytes": args.store_max_bytes,
             "block_size": block_size,
-            "requested_max_num_batched_tokens": args.max_num_batched_tokens,
+            "requested_max_num_batched_tokens": requested_max_num_batched_tokens,
             "effective_max_num_batched_tokens": effective_max_num_batched_tokens,
             "prefill_prompt_tokens": len(prompt_prefill_tokens),
             "partial_prompt_tokens": len(prompt_partial_tokens),
