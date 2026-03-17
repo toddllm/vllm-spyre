@@ -21,8 +21,11 @@ from spyre_kv_reuse_common import (
     drain_scheduler_stats,
     extract_output_token_count,
     get_worker_probe_state,
+    round_down_to_block,
     set_local_dist_defaults,
 )
+
+SPYRE_DEMO_BLOCK_SIZE = 64
 
 
 def _run_once(llm, prompt_input, sampling_params, label: str) -> dict[str, Any]:
@@ -64,7 +67,7 @@ def main() -> int:
     parser.add_argument("--max-num-seqs", type=int, default=4)
     parser.add_argument("--max-num-batched-tokens", type=int, default=128)
     parser.add_argument("--max-new-tokens", type=int, default=8)
-    parser.add_argument("--shared-prefix-tokens", type=int, default=192)
+    parser.add_argument("--shared-prefix-tokens", type=int, default=128)
     parser.add_argument("--partial-tail-tokens", type=int, default=16)
     parser.add_argument(
         "--decode-variant",
@@ -105,12 +108,27 @@ def main() -> int:
 
     reset_global_store("serialized_shared_memory_service")
 
+    planned_aligned_shared_prefix_tokens = round_down_to_block(
+        args.shared_prefix_tokens,
+        SPYRE_DEMO_BLOCK_SIZE,
+    )
+    if planned_aligned_shared_prefix_tokens == 0:
+        planned_aligned_shared_prefix_tokens = SPYRE_DEMO_BLOCK_SIZE
+
+    planned_partial_prompt_tokens = (
+        planned_aligned_shared_prefix_tokens + max(0, args.partial_tail_tokens)
+    )
+    effective_max_num_batched_tokens = max(
+        args.max_num_batched_tokens,
+        planned_partial_prompt_tokens,
+    )
+
     llm_kwargs: dict[str, Any] = {
         "model": args.model,
         "tokenizer": args.model,
         "max_model_len": args.max_model_len,
         "max_num_seqs": args.max_num_seqs,
-        "max_num_batched_tokens": args.max_num_batched_tokens,
+        "max_num_batched_tokens": effective_max_num_batched_tokens,
         "enable_prefix_caching": False,
         "kv_transfer_config": {
             "kv_connector": "InMemorySpyreConnector",
@@ -128,6 +146,10 @@ def main() -> int:
     try:
         tokenizer = llm.get_tokenizer()
         block_size = int(llm.llm_engine.vllm_config.cache_config.block_size)
+        if block_size != SPYRE_DEMO_BLOCK_SIZE:
+            raise SystemExit(
+                f"Unexpected block size {block_size}; sequential handoff demo assumes {SPYRE_DEMO_BLOCK_SIZE}."
+            )
         prompt_data = build_aligned_reuse_token_prompts(
             tokenizer,
             requested_shared_prefix_tokens=args.shared_prefix_tokens,
@@ -181,6 +203,8 @@ def main() -> int:
             "service_socket": args.service_socket,
             "store_max_bytes": args.store_max_bytes,
             "block_size": block_size,
+            "requested_max_num_batched_tokens": args.max_num_batched_tokens,
+            "effective_max_num_batched_tokens": effective_max_num_batched_tokens,
             "prefill_prompt_tokens": len(prompt_prefill_tokens),
             "partial_prompt_tokens": len(prompt_partial_tokens),
             "requested_shared_prefix_tokens": prompt_data["requested_shared_prefix_tokens"],
