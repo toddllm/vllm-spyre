@@ -401,6 +401,17 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
                     for current, extra in zip(current_block_ids, extra_block_ids)
                 )
 
+            logger.info(
+                "[ChunkedPrefillSpyreScheduler] mirror_prefill req=%s "
+                "num_computed_tokens=%d scheduled_tokens=%d current_block_ids=%s "
+                "extra_block_ids=%s merged_block_ids=%s",
+                req_id,
+                request.num_computed_tokens,
+                outputs.num_scheduled_tokens.get(req_id, -1),
+                current_block_ids,
+                extra_block_ids,
+                merged_block_ids,
+            )
             self.connector.update_state_after_alloc(tracked_request, merged_block_ids, 0)
 
     def can_schedule_prefill(self, request: Request) -> bool:

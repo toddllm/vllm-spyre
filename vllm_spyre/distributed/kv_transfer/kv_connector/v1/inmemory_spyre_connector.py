@@ -272,6 +272,15 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             if not req_meta.is_store:
                 continue
 
+            logger.info(
+                "[InMemorySpyreConnector] save_kv_bulk req=%s token_count=%d "
+                "block_ids=%s store_stats_before=%s",
+                req_meta.req_id,
+                req_meta.token_count,
+                req_meta.block_ids,
+                self._store.stats(),
+            )
+
             for layer_idx, layer_name in enumerate(self._layer_names):
                 staging = self._kv_caches.get(layer_name)
                 if staging is None:
@@ -292,6 +301,11 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                         )
                         save_count += 1
 
+            logger.info(
+                "[InMemorySpyreConnector] save_kv_bulk req=%s store_stats_after=%s",
+                req_meta.req_id,
+                self._store.stats(),
+            )
             self._step_stores.add(req_meta.req_id)
 
         self._blocks_saved += save_count
