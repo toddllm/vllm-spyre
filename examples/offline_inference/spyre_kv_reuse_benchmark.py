@@ -88,26 +88,125 @@ def _format_live_result_line(
     run: dict[str, Any],
     baseline_latency_seconds: float | None = None,
     cumulative_saved_ms: float | None = None,
+    style: str = "scientific",
 ) -> str:
     worker_delta = run["worker_delta"]
+    latency_seconds = float(run["latency_seconds"])
+
+    if style == "demo":
+        if stage == "exact_warmup":
+            return f"Warmup (not counted): {latency_seconds:.3f}s"
+        if stage == "exact_warm_baseline":
+            return f"Warm baseline: {latency_seconds:.3f}s"
+        if stage == "exact_reuse":
+            parts = [f"Reuse {turn_index}/{total_turns}: {latency_seconds:.3f}s"]
+            if baseline_latency_seconds is not None and latency_seconds > 0:
+                saved_ms = 1000.0 * (baseline_latency_seconds - latency_seconds)
+                parts.append(f"saved {saved_ms:.1f} ms")
+                parts.append(
+                    f"{(baseline_latency_seconds / latency_seconds):.2f}x faster"
+                )
+                if cumulative_saved_ms is not None:
+                    parts.append(f"cumulative {cumulative_saved_ms:.1f} ms")
+            return " | ".join(parts)
+
     parts = [
         f"{stage}[{turn_index}/{total_turns}]",
-        f"latency_s={float(run['latency_seconds']):.6f}",
+        f"latency_s={latency_seconds:.6f}",
         f"output_tokens={int(run['output_tokens'])}",
         f"blocks_loaded={int(worker_delta.get('blocks_loaded', 0))}",
         f"blocks_missing={int(worker_delta.get('blocks_missing', 0))}",
         f"blocks_saved={int(worker_delta.get('blocks_saved', 0))}",
     ]
     if baseline_latency_seconds is not None and float(run["latency_seconds"]) > 0:
-        saved_ms = 1000.0 * (baseline_latency_seconds - float(run["latency_seconds"]))
+        saved_ms = 1000.0 * (baseline_latency_seconds - latency_seconds)
         parts.append(f"saved_ms={saved_ms:.3f}")
         parts.append(
             "speedup_vs_baseline="
-            f"{(baseline_latency_seconds / float(run['latency_seconds'])):.3f}x"
+            f"{(baseline_latency_seconds / latency_seconds):.3f}x"
         )
         if cumulative_saved_ms is not None:
             parts.append(f"cumulative_saved_ms={cumulative_saved_ms:.3f}")
     return " ".join(parts)
+
+
+def _format_live_header(
+    *,
+    style: str,
+    prompt_exact_tokens: int,
+    block_size: int,
+    max_new_tokens: int,
+    warmup_runs: int,
+    reuse_turns: int,
+    sleep_between_live_lines_s: float,
+) -> list[str]:
+    prompt_blocks = (prompt_exact_tokens + block_size - 1) // block_size
+    if style == "demo":
+        return [
+            "Demo: Warm baseline vs exact KV reuse",
+            (
+                f"Prompt: {prompt_exact_tokens} tokens across {prompt_blocks} KV blocks"
+                f" | Generate: {max_new_tokens} token"
+                f"{'' if max_new_tokens == 1 else 's'}"
+            ),
+            (
+                f"Warmup runs: {warmup_runs} | Reuse turns: {reuse_turns}"
+                f" | Pause between lines: {sleep_between_live_lines_s:.2f}s"
+            ),
+            "",
+        ]
+
+    return [
+        "live_demo "
+        f"prompt_tokens={prompt_exact_tokens} "
+        f"prompt_blocks={prompt_blocks} "
+        f"max_new_tokens={max_new_tokens} "
+        f"warmup_runs={warmup_runs} "
+        f"reuse_turns={reuse_turns} "
+        f"sleep_between_live_lines_s={sleep_between_live_lines_s:.3f}"
+    ]
+
+
+def _format_live_footer(
+    *,
+    style: str,
+    baseline_latency_seconds: float,
+    reuse_runs: list[dict[str, Any]],
+) -> list[str]:
+    if style != "demo" or not reuse_runs:
+        return []
+
+    cumulative_saved_ms = sum(
+        1000.0 * (baseline_latency_seconds - float(run["latency_seconds"]))
+        for run in reuse_runs
+    )
+    mean_reuse_latency = statistics.fmean(
+        float(run["latency_seconds"]) for run in reuse_runs
+    )
+    mean_speedup = (
+        baseline_latency_seconds / mean_reuse_latency
+        if mean_reuse_latency > 0
+        else 0.0
+    )
+    all_clean = all(
+        int(run["worker_delta"].get("blocks_loaded", 0)) > 0
+        and int(run["worker_delta"].get("blocks_missing", 0)) == 0
+        for run in reuse_runs
+    )
+
+    footer = [
+        "",
+        f"Total time saved across reuse turns: {cumulative_saved_ms:.1f} ms",
+        f"Average speedup vs warm baseline: {mean_speedup:.2f}x",
+    ]
+    if all_clean:
+        footer.append("Connector reuse verified on every reuse turn.")
+    return footer
+
+
+def _emit_live_lines(lines: list[str]) -> None:
+    for line in lines:
+        print(line, flush=True)
 
 
 def _sleep_between_live_lines(seconds: float) -> None:
@@ -207,18 +306,20 @@ def _run_exact_live_demo(
     prompt_exact_tokens: int,
     block_size: int,
     max_new_tokens: int,
+    live_output_style: str,
 ) -> dict[str, Any]:
     warmup_runs_data: list[dict[str, Any]] = []
     if print_live:
-        prompt_blocks = (prompt_exact_tokens + block_size - 1) // block_size
-        print(
-            "live_demo "
-            f"prompt_tokens={prompt_exact_tokens} "
-            f"prompt_blocks={prompt_blocks} "
-            f"max_new_tokens={max_new_tokens} "
-            f"warmup_runs={warmup_runs} "
-            f"reuse_turns={reuse_turns} "
-            f"sleep_between_live_lines_s={sleep_between_live_lines_s:.3f}"
+        _emit_live_lines(
+            _format_live_header(
+                style=live_output_style,
+                prompt_exact_tokens=prompt_exact_tokens,
+                block_size=block_size,
+                max_new_tokens=max_new_tokens,
+                warmup_runs=warmup_runs,
+                reuse_turns=reuse_turns,
+                sleep_between_live_lines_s=sleep_between_live_lines_s,
+            )
         )
         _sleep_between_live_lines(sleep_between_live_lines_s)
 
@@ -233,14 +334,15 @@ def _run_exact_live_demo(
         )
         warmup_runs_data.append(warmup_run)
         if print_live:
-            print(
+            _emit_live_lines([
                 _format_live_result_line(
                     stage="exact_warmup",
                     turn_index=warmup_idx + 1,
                     total_turns=warmup_runs,
                     run=warmup_run,
+                    style=live_output_style,
                 )
-            )
+            ])
             _sleep_between_live_lines(sleep_between_live_lines_s)
 
     _clear_store_backend(store_backend, service_socket)
@@ -252,14 +354,15 @@ def _run_exact_live_demo(
         "exact_warm_baseline",
     )
     if print_live:
-        print(
+        _emit_live_lines([
             _format_live_result_line(
                 stage="exact_warm_baseline",
                 turn_index=1,
                 total_turns=1,
                 run=warm_baseline_run,
+                style=live_output_style,
             )
-        )
+        ])
         _sleep_between_live_lines(sleep_between_live_lines_s)
 
     exact_reuse_runs: list[dict[str, Any]] = []
@@ -287,7 +390,7 @@ def _run_exact_live_demo(
         exact_reuse["cumulative_saved_ms_vs_baseline"] = cumulative_saved_ms
         exact_reuse_runs.append(exact_reuse)
         if print_live:
-            print(
+            _emit_live_lines([
                 _format_live_result_line(
                     stage="exact_reuse",
                     turn_index=reuse_idx + 1,
@@ -295,9 +398,19 @@ def _run_exact_live_demo(
                     run=exact_reuse,
                     baseline_latency_seconds=baseline_latency_seconds,
                     cumulative_saved_ms=cumulative_saved_ms,
+                    style=live_output_style,
                 )
-            )
+            ])
             _sleep_between_live_lines(sleep_between_live_lines_s)
+
+    if print_live:
+        _emit_live_lines(
+            _format_live_footer(
+                style=live_output_style,
+                baseline_latency_seconds=baseline_latency_seconds,
+                reuse_runs=exact_reuse_runs,
+            )
+        )
 
     return {
         "warmup_runs": warmup_runs_data,
@@ -336,6 +449,11 @@ def main() -> int:
     parser.add_argument("--aligned-prompts", action="store_true")
     parser.add_argument("--exact-only", action="store_true")
     parser.add_argument("--print-live", action="store_true")
+    parser.add_argument(
+        "--live-output-style",
+        choices=("scientific", "demo"),
+        default="scientific",
+    )
     parser.add_argument("--sleep-between-live-lines", type=float, default=0.0)
     parser.add_argument("--no-assert-reuse", action="store_true")
     args = parser.parse_args()
@@ -350,6 +468,8 @@ def main() -> int:
     os.environ.setdefault("VLLM_SPYRE_DYNAMO_BACKEND", args.backend)
     os.environ.setdefault("VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE", "1")
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    if args.live_output_style == "demo":
+        os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
     os.environ["VLLM_SPYRE_KV_STORE_BACKEND"] = args.store_backend
     os.environ["VLLM_SPYRE_KV_STORE_MAX_BYTES"] = str(args.store_max_bytes)
     if args.service_socket:
@@ -491,6 +611,7 @@ def main() -> int:
                 prompt_exact_tokens=len(prompt_exact_tokens),
                 block_size=block_size,
                 max_new_tokens=args.max_new_tokens,
+                live_output_style=args.live_output_style,
             )
             exact_cold_runs = [live_demo["warm_baseline"]]
             exact_reuse_runs = list(live_demo["reuse_runs"])
@@ -518,6 +639,7 @@ def main() -> int:
                             turn_index=repeat_idx + 1,
                             total_turns=args.repeats,
                             run=exact_cold,
+                            style=args.live_output_style,
                         )
                     )
                     print(
@@ -527,6 +649,7 @@ def main() -> int:
                             total_turns=args.repeats,
                             run=exact_reuse,
                             baseline_latency_seconds=float(exact_cold["latency_seconds"]),
+                            style=args.live_output_style,
                         )
                     )
                 if args.exact_only:
@@ -563,6 +686,7 @@ def main() -> int:
                             turn_index=repeat_idx + 1,
                             total_turns=args.repeats,
                             run=partial_cold,
+                            style=args.live_output_style,
                         )
                     )
                     print(
@@ -572,6 +696,7 @@ def main() -> int:
                             total_turns=args.repeats,
                             run=partial_reuse,
                             baseline_latency_seconds=float(partial_cold["latency_seconds"]),
+                            style=args.live_output_style,
                         )
                     )
 
@@ -602,6 +727,7 @@ def main() -> int:
             "exact_only": args.exact_only,
             "demo_mode": args.demo_mode,
             "warmup_runs": args.warmup_runs,
+            "live_output_style": args.live_output_style,
             "sleep_between_live_lines": args.sleep_between_live_lines,
             "fit_prompt_in_single_prefill": args.fit_prompt_in_single_prefill,
             "block_size": block_size,

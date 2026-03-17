@@ -54,6 +54,30 @@ def test_format_live_result_line_includes_speedup_when_baseline_provided():
     assert "speedup_vs_baseline=4.000x" in line
 
 
+def test_format_live_result_line_demo_style_is_cleaner():
+    line = _format_live_result_line(
+        stage="exact_reuse",
+        turn_index=1,
+        total_turns=4,
+        run={
+            "latency_seconds": 0.084474,
+            "output_tokens": 1,
+            "worker_delta": {
+                "blocks_loaded": 56,
+                "blocks_missing": 0,
+                "blocks_saved": 56,
+            },
+        },
+        baseline_latency_seconds=0.186547,
+        cumulative_saved_ms=102.073,
+        style="demo",
+    )
+
+    assert line == (
+        "Reuse 1/4: 0.084s | saved 102.1 ms | 2.21x faster | cumulative 102.1 ms"
+    )
+
+
 def test_format_live_result_line_includes_cumulative_saved_time_when_provided():
     line = _format_live_result_line(
         stage="exact_reuse",
