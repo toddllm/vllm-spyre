@@ -2,6 +2,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from multiprocessing import shared_memory
 
 import vllm_spyre.envs as envs_spyre
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
@@ -15,6 +16,7 @@ from vllm_spyre.distributed.kv_transfer.kv_connector.v1.metadata import (
     HostMemoryKVStoreBackend,
     InMemoryKVStore,
     KVKind,
+    SerializedSharedMemoryKVStoreBackend,
     SerializedUDSProcessKVStoreBackend,
     SerializedHostMemoryKVStoreBackend,
     SpyreConnectorMeta,
@@ -183,7 +185,11 @@ class TestMetadataSchema:
 
     @pytest.mark.parametrize(
         "backend_cls",
-        [SerializedHostMemoryKVStoreBackend, SerializedUDSProcessKVStoreBackend],
+        [
+            SerializedHostMemoryKVStoreBackend,
+            SerializedSharedMemoryKVStoreBackend,
+            SerializedUDSProcessKVStoreBackend,
+        ],
     )
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     def test_serialized_store_backends_load_into_destination_tensor(self, backend_cls, dtype):
@@ -200,8 +206,29 @@ class TestMetadataSchema:
             assert torch.equal(dest, source)
             assert store.stats()["backend_name"] in {
                 "serialized_host_memory",
+                "serialized_shared_memory",
                 "serialized_uds_process_store",
             }
+        finally:
+            store.shutdown()
+
+    def test_serialized_shared_memory_backend_unlinks_segments_on_remove(self):
+        store = SerializedSharedMemoryKVStoreBackend()
+        key = StoreKey(req_id="req-1", layer_idx=0, block_id=0, kv_kind=KVKind.K)
+        source = torch.arange(16, dtype=torch.float32).reshape(2, 2, 4)
+
+        try:
+            store.put(key, source, source_req="req-1")
+            entry = store._store[key]
+
+            shm = shared_memory.SharedMemory(name=entry.shm_name, create=False)
+            shm.close()
+
+            removed = store.remove_by_req("req-1")
+            assert removed == 1
+
+            with pytest.raises(FileNotFoundError):
+                shared_memory.SharedMemory(name=entry.shm_name, create=False)
         finally:
             store.shutdown()
 
@@ -214,6 +241,7 @@ class TestMetadataSchema:
         [
             HostMemoryKVStoreBackend,
             SerializedHostMemoryKVStoreBackend,
+            SerializedSharedMemoryKVStoreBackend,
             SerializedUDSProcessKVStoreBackend,
         ],
     )

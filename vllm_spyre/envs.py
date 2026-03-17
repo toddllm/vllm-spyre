@@ -150,6 +150,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - "host_memory": store CPU tensor clones directly
     # - "serialized_host_memory": store serialized CPU payload bytes and
     #   reconstruct tensors on load to better approximate a transport step
+    # - "serialized_shared_memory": store serialized CPU payload bytes in
+    #   named shared-memory segments and map them on load
     # - "serialized_uds_process_store": store serialized CPU payload bytes in
     #   a local subprocess reached over a Unix domain socket
     "VLLM_SPYRE_KV_STORE_BACKEND": lambda: os.getenv(
