@@ -69,7 +69,11 @@ def _effective_max_num_batched_tokens(
     required_tokens: int,
     block_size: int,
     aligned_prompts: bool,
+    fit_prompt_in_single_prefill: bool,
 ) -> int:
+    if not fit_prompt_in_single_prefill:
+        return requested_tokens
+
     effective = max(requested_tokens, required_tokens)
     if aligned_prompts:
         return ((effective + block_size - 1) // block_size) * block_size
@@ -280,6 +284,7 @@ def main() -> int:
     parser.add_argument("--shared-prefix-tokens", type=int, default=192)
     parser.add_argument("--partial-tail-tokens", type=int, default=16)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--fit-prompt-in-single-prefill", action="store_true")
     parser.add_argument(
         "--demo-mode",
         choices=("paired_benchmark", "warm_baseline_then_reuse"),
@@ -384,6 +389,7 @@ def main() -> int:
         required_tokens=required_prompt_tokens,
         block_size=probe_block_size,
         aligned_prompts=args.aligned_prompts,
+        fit_prompt_in_single_prefill=args.fit_prompt_in_single_prefill,
     )
 
     llm_kwargs: dict[str, Any] = {
@@ -547,6 +553,7 @@ def main() -> int:
             "exact_only": args.exact_only,
             "demo_mode": args.demo_mode,
             "warmup_runs": args.warmup_runs,
+            "fit_prompt_in_single_prefill": args.fit_prompt_in_single_prefill,
             "block_size": block_size,
             "repeats": args.repeats,
             "requested_max_num_batched_tokens": args.max_num_batched_tokens,

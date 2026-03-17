@@ -61,6 +61,7 @@ def test_effective_max_num_batched_tokens_rounds_up_for_aligned_prompts():
             required_tokens=385,
             block_size=64,
             aligned_prompts=True,
+            fit_prompt_in_single_prefill=True,
         )
         == 448
     )
@@ -73,6 +74,20 @@ def test_effective_max_num_batched_tokens_keeps_requested_non_aligned_value():
             required_tokens=180,
             block_size=64,
             aligned_prompts=False,
+            fit_prompt_in_single_prefill=True,
         )
         == 256
+    )
+
+
+def test_effective_max_num_batched_tokens_keeps_requested_value_by_default():
+    assert (
+        _effective_max_num_batched_tokens(
+            requested_tokens=128,
+            required_tokens=385,
+            block_size=64,
+            aligned_prompts=True,
+            fit_prompt_in_single_prefill=False,
+        )
+        == 128
     )
