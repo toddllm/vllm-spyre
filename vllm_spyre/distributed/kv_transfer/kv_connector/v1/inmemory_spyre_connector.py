@@ -19,13 +19,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from vllm_spyre.distributed.kv_transfer.kv_connector.v1.metadata import (
-    HostMemoryKVStoreBackend,
     KVKind,
     SpyreConnectorMeta,
     SpyreConnectorRequestMeta,
     SpyreConnectorStats,
     SpyreKVStoreBackend,
     StoreKey,
+    build_spyre_kv_store_backend,
 )
 
 if TYPE_CHECKING:
@@ -41,23 +41,26 @@ logger = logging.getLogger(__name__)
 _GLOBAL_STORE: SpyreKVStoreBackend | None = None
 
 
-def get_global_store() -> SpyreKVStoreBackend:
+def _build_configured_store(store_backend_name: str | None = None) -> SpyreKVStoreBackend:
+    backend_name = store_backend_name or envs_spyre.VLLM_SPYRE_KV_STORE_BACKEND
+    return build_spyre_kv_store_backend(
+        backend_name,
+        max_bytes=envs_spyre.VLLM_SPYRE_KV_STORE_MAX_BYTES,
+    )
+
+
+def get_global_store(store_backend_name: str | None = None) -> SpyreKVStoreBackend:
     global _GLOBAL_STORE
     if _GLOBAL_STORE is None:
-        _GLOBAL_STORE = HostMemoryKVStoreBackend(
-            max_bytes=envs_spyre.VLLM_SPYRE_KV_STORE_MAX_BYTES
-        )
+        _GLOBAL_STORE = _build_configured_store(store_backend_name)
     return _GLOBAL_STORE
 
 
-def reset_global_store() -> None:
+def reset_global_store(store_backend_name: str | None = None) -> None:
     global _GLOBAL_STORE
     if _GLOBAL_STORE is not None:
         _GLOBAL_STORE.clear()
-    else:
-        _GLOBAL_STORE = HostMemoryKVStoreBackend(
-            max_bytes=envs_spyre.VLLM_SPYRE_KV_STORE_MAX_BYTES
-        )
+    _GLOBAL_STORE = _build_configured_store(store_backend_name)
 
 
 @dataclass(frozen=True)

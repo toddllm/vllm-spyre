@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+import vllm_spyre.envs as envs_spyre
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
@@ -14,8 +15,10 @@ from vllm_spyre.distributed.kv_transfer.kv_connector.v1.metadata import (
     HostMemoryKVStoreBackend,
     InMemoryKVStore,
     KVKind,
+    SerializedHostMemoryKVStoreBackend,
     SpyreConnectorMeta,
     SpyreConnectorRequestMeta,
+    build_spyre_kv_store_backend,
     StoreKey,
 )
 
@@ -154,6 +157,41 @@ class TestMetadataSchema:
         dest = torch.zeros_like(source)
         assert store.load_into(key, dest) is True
         assert torch.equal(dest, source)
+
+    def test_serialized_host_memory_store_backend_loads_into_destination_tensor(self):
+        store = SerializedHostMemoryKVStoreBackend()
+        key = StoreKey(req_id="req-1", layer_idx=0, block_id=0, kv_kind=KVKind.K)
+        source = torch.arange(16, dtype=torch.float32).reshape(2, 2, 4)
+
+        version, was_overwrite = store.put(key, source, source_req="req-1")
+        assert version == 1
+        assert was_overwrite is False
+
+        dest = torch.zeros_like(source)
+        assert store.load_into(key, dest) is True
+        assert torch.equal(dest, source)
+        assert store.stats()["backend_name"] == "serialized_host_memory"
+
+    def test_build_spyre_kv_store_backend_rejects_unknown_name(self):
+        with pytest.raises(ValueError, match="Unknown Spyre KV store backend"):
+            build_spyre_kv_store_backend("not-a-real-backend")
+
+    def test_reset_global_store_uses_selected_backend(self, monkeypatch: pytest.MonkeyPatch):
+        from vllm_spyre.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector import (
+            get_global_store,
+            reset_global_store,
+        )
+
+        monkeypatch.setenv("VLLM_SPYRE_KV_STORE_BACKEND", "serialized_host_memory")
+        envs_spyre.clear_env_cache()
+        reset_global_store()
+
+        store = get_global_store()
+        assert isinstance(store, SerializedHostMemoryKVStoreBackend)
+
+        monkeypatch.setenv("VLLM_SPYRE_KV_STORE_BACKEND", "host_memory")
+        envs_spyre.clear_env_cache()
+        reset_global_store()
 
 
 @pytest.mark.cpu

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     VLLM_SPYRE_MODEL_CONFIG_FILE: str | None = None
     VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE: bool = False
     VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE: int = 1024
+    VLLM_SPYRE_KV_STORE_BACKEND: str = "host_memory"
     VLLM_SPYRE_KV_STORE_MAX_BYTES: int = 0
 
 logger = init_logger(__name__)
@@ -143,6 +144,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Maximum number of completed requests retained for exact-prefix reuse.
     "VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE": lambda: int(
         os.getenv("VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE", "1024")
+    ),
+    # Selects the internal KV store backend used under the Spyre connector.
+    # Available options:
+    # - "host_memory": store CPU tensor clones directly
+    # - "serialized_host_memory": store serialized CPU payload bytes and
+    #   reconstruct tensors on load to better approximate a transport step
+    "VLLM_SPYRE_KV_STORE_BACKEND": lambda: os.getenv(
+        "VLLM_SPYRE_KV_STORE_BACKEND", "host_memory"
     ),
     # Byte cap for the in-memory KV store. A value of 0 disables eviction by
     # size and relies only on the saved-request registry cap.

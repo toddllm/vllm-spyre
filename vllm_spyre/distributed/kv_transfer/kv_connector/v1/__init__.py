@@ -5,10 +5,12 @@ from vllm_spyre.distributed.kv_transfer.kv_connector.v1.metadata import (
     HostMemoryKVStoreBackend,
     InMemoryKVStore,
     KVKind,
+    SerializedHostMemoryKVStoreBackend,
     SpyreConnectorMeta,
     SpyreConnectorRequestMeta,
     SpyreKVStoreBackend,
     StoreKey,
+    build_spyre_kv_store_backend,
 )
 
 __all__ = [
@@ -16,8 +18,10 @@ __all__ = [
     "InMemoryKVStore",
     "InMemorySpyreConnector",
     "KVKind",
+    "SerializedHostMemoryKVStoreBackend",
     "SpyreConnectorMeta",
     "SpyreConnectorRequestMeta",
     "SpyreKVStoreBackend",
     "StoreKey",
+    "build_spyre_kv_store_backend",
 ]

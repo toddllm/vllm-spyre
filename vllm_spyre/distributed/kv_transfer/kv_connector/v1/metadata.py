@@ -46,7 +46,25 @@ class HostMemoryKVEntry:
         return self.shape == expected_shape and self.dtype == expected_dtype
 
 
+@dataclass
+class SerializedHostMemoryKVEntry:
+    payload: bytes
+    dtype: str
+    shape: tuple[int, ...]
+    version: int = 1
+    source_req: str = ""
+
+    def matches_shape_and_dtype(
+        self, expected_shape: tuple[int, ...], expected_dtype: str
+    ) -> bool:
+        return self.shape == expected_shape and self.dtype == expected_dtype
+
+
 class SpyreKVStoreBackend(ABC):
+    @property
+    @abstractmethod
+    def backend_name(self) -> str: ...
+
     @property
     @abstractmethod
     def size(self) -> int: ...
@@ -88,6 +106,14 @@ class SpyreKVStoreBackend(ABC):
 
     @abstractmethod
     def stats(self) -> dict[str, Any]: ...
+
+
+def _dtype_from_str(dtype_str: str) -> torch.dtype:
+    dtype_name = dtype_str.removeprefix("torch.")
+    dtype = getattr(torch, dtype_name, None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"Unsupported dtype string '{dtype_str}'")
+    return dtype
 
 
 @dataclass
@@ -216,6 +242,10 @@ class HostMemoryKVStoreBackend(SpyreKVStoreBackend):
         self._evictions = 0
 
     @property
+    def backend_name(self) -> str:
+        return "host_memory"
+
+    @property
     def size(self) -> int:
         return len(self._store)
 
@@ -307,6 +337,7 @@ class HostMemoryKVStoreBackend(SpyreKVStoreBackend):
     def stats(self) -> dict[str, Any]:
         req_ids = {k.req_id for k in self._store}
         return {
+            "backend_name": self.backend_name,
             "total_entries": len(self._store),
             "unique_requests": len(req_ids),
             "version_counter": self._version_counter,
@@ -314,6 +345,159 @@ class HostMemoryKVStoreBackend(SpyreKVStoreBackend):
             "max_bytes": self._max_bytes,
             "evictions": self._evictions,
         }
+
+
+class SerializedHostMemoryKVStoreBackend(SpyreKVStoreBackend):
+    def __init__(self, max_bytes: int = 0) -> None:
+        self._store: dict[StoreKey, SerializedHostMemoryKVEntry] = {}
+        self._version_counter = 0
+        self._max_bytes = max(0, max_bytes)
+        self._current_bytes = 0
+        self._evictions = 0
+
+    @property
+    def backend_name(self) -> str:
+        return "serialized_host_memory"
+
+    @property
+    def size(self) -> int:
+        return len(self._store)
+
+    @property
+    def current_bytes(self) -> int:
+        return self._current_bytes
+
+    @property
+    def max_bytes(self) -> int:
+        return self._max_bytes
+
+    @property
+    def evictions(self) -> int:
+        return self._evictions
+
+    @staticmethod
+    def _entry_bytes(entry: SerializedHostMemoryKVEntry) -> int:
+        return len(entry.payload)
+
+    @staticmethod
+    def _serialize_tensor(data: torch.Tensor) -> bytes:
+        return data.detach().contiguous().cpu().numpy().tobytes()
+
+    @staticmethod
+    def _materialize_tensor(entry: SerializedHostMemoryKVEntry) -> torch.Tensor:
+        source = torch.frombuffer(bytearray(entry.payload), dtype=_dtype_from_str(entry.dtype))
+        return source.reshape(entry.shape)
+
+    def put(
+        self,
+        key: StoreKey,
+        data: torch.Tensor,
+        source_req: str = "",
+    ) -> tuple[int, bool]:
+        self._version_counter += 1
+        version = self._version_counter
+        was_overwrite = key in self._store
+
+        if was_overwrite:
+            old = self._store[key]
+            self._current_bytes -= self._entry_bytes(old)
+
+        entry = SerializedHostMemoryKVEntry(
+            payload=self._serialize_tensor(data),
+            dtype=str(data.dtype),
+            shape=tuple(data.shape),
+            version=version,
+            source_req=source_req,
+        )
+        entry_size = self._entry_bytes(entry)
+
+        if self._max_bytes > 0:
+            while self._store and self._current_bytes + entry_size > self._max_bytes:
+                self._evict_oldest()
+
+        self._store[key] = entry
+        self._current_bytes += entry_size
+        return version, was_overwrite
+
+    def _evict_oldest(self) -> StoreKey | None:
+        if not self._store:
+            return None
+        oldest_key = next(iter(self._store))
+        oldest_entry = self._store.pop(oldest_key)
+        self._current_bytes -= self._entry_bytes(oldest_entry)
+        self._evictions += 1
+        return oldest_key
+
+    def get(self, key: StoreKey) -> HostMemoryKVEntry | None:
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        return HostMemoryKVEntry(
+            data=self._materialize_tensor(entry),
+            dtype=entry.dtype,
+            shape=entry.shape,
+            version=entry.version,
+            source_req=entry.source_req,
+        )
+
+    def load_into(self, key: StoreKey, dest: torch.Tensor) -> bool:
+        entry = self._store.get(key)
+        if entry is None:
+            return False
+
+        try:
+            dest.copy_(self._materialize_tensor(entry))
+        except RuntimeError:
+            return False
+        return True
+
+    def contains(self, key: StoreKey) -> bool:
+        return key in self._store
+
+    def remove_by_req(self, req_id: str) -> int:
+        keys = [k for k in self._store if k.req_id == req_id]
+        for key in keys:
+            entry = self._store.pop(key)
+            self._current_bytes -= self._entry_bytes(entry)
+        return len(keys)
+
+    def clear(self) -> None:
+        self._store.clear()
+        self._version_counter = 0
+        self._current_bytes = 0
+
+    def stats(self) -> dict[str, Any]:
+        req_ids = {k.req_id for k in self._store}
+        return {
+            "backend_name": self.backend_name,
+            "total_entries": len(self._store),
+            "unique_requests": len(req_ids),
+            "version_counter": self._version_counter,
+            "memory_estimate_bytes": self._current_bytes,
+            "max_bytes": self._max_bytes,
+            "evictions": self._evictions,
+        }
+
+
+_STORE_BACKEND_TYPES: dict[str, type[SpyreKVStoreBackend]] = {
+    "host_memory": HostMemoryKVStoreBackend,
+    "serialized_host_memory": SerializedHostMemoryKVStoreBackend,
+}
+
+
+def build_spyre_kv_store_backend(
+    backend_name: str,
+    *,
+    max_bytes: int = 0,
+) -> SpyreKVStoreBackend:
+    backend_key = backend_name.strip().lower()
+    backend_type = _STORE_BACKEND_TYPES.get(backend_key)
+    if backend_type is None:
+        supported = ", ".join(sorted(_STORE_BACKEND_TYPES))
+        raise ValueError(
+            f"Unknown Spyre KV store backend '{backend_name}'. Supported backends: {supported}"
+        )
+    return backend_type(max_bytes=max_bytes)
 
 
 # Backward-compatible aliases for the current slice, tests, and examples.
