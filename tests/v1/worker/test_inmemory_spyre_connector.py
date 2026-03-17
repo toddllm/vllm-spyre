@@ -350,6 +350,45 @@ class TestMetadataSchema:
             store_b.shutdown()
             _stop_persistent_service(service, socket_path)
 
+    def test_service_store_backend_unregisters_shared_memory_attachments(self, monkeypatch):
+        import vllm_spyre.distributed.kv_transfer.kv_connector.v1.metadata as metadata_module
+
+        socket_path = _short_socket_path("spyre-kv-service")
+        service = _start_persistent_service(socket_path)
+        store_a = build_spyre_kv_store_backend(
+            "serialized_shared_memory_service",
+            service_socket=socket_path,
+        )
+        store_b = build_spyre_kv_store_backend(
+            "serialized_shared_memory_service",
+            service_socket=socket_path,
+        )
+        key = StoreKey(req_id="req-1", layer_idx=0, block_id=0, kv_kind=KVKind.K)
+        source = torch.arange(16, dtype=torch.float32).reshape(2, 2, 4)
+        unregister_calls = []
+
+        def _record_unregister(name, rtype):
+            unregister_calls.append((name, rtype))
+
+        monkeypatch.setattr(
+            metadata_module.resource_tracker,
+            "unregister",
+            _record_unregister,
+        )
+
+        try:
+            store_a.put(key, source, source_req="req-1")
+            dest = torch.zeros_like(source)
+
+            assert store_b.load_into(key, dest) is True
+            assert torch.equal(dest, source)
+            assert unregister_calls
+            assert all(rtype == "shared_memory" for _, rtype in unregister_calls)
+        finally:
+            store_a.shutdown()
+            store_b.shutdown()
+            _stop_persistent_service(service, socket_path)
+
     @pytest.mark.parametrize(
         "backend_cls",
         [

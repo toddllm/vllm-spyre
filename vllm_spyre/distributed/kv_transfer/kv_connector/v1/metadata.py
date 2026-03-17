@@ -98,6 +98,19 @@ class SerializedSharedMemoryKVEntry:
         return self.shape == expected_shape and self.dtype == expected_dtype
 
 
+def _unregister_shared_memory_attachment(
+    entry_name: str, shm: shared_memory.SharedMemory
+) -> None:
+    # This process is only attaching to a segment owned elsewhere. Unregister
+    # the attachment so Python does not try to unlink it again at interpreter
+    # shutdown.
+    tracker_name = str(getattr(shm, "_name", entry_name))
+    try:
+        resource_tracker.unregister(tracker_name, "shared_memory")
+    except Exception:
+        pass
+
+
 class SpyreKVStoreBackend(ABC):
     @property
     @abstractmethod
@@ -709,17 +722,7 @@ class SerializedSharedMemoryKVStoreBackend(SpyreKVStoreBackend):
             return None
 
         try:
-            # This process is only attaching to a segment owned by the service.
-            # Unregister the attachment so Python does not try to unlink it again
-            # at interpreter shutdown.
-            for tracker_name in {
-                str(entry.shm_name),
-                str(getattr(shm, "_name", entry.shm_name)),
-            }:
-                try:
-                    resource_tracker.unregister(tracker_name, "shared_memory")
-                except Exception:
-                    pass
+            _unregister_shared_memory_attachment(entry.shm_name, shm)
         except Exception:
             pass
 
@@ -949,6 +952,11 @@ class SerializedSharedMemoryServiceKVStoreBackend(SpyreKVStoreBackend):
             shm = shared_memory.SharedMemory(name=entry.shm_name, create=False)
         except FileNotFoundError:
             return None
+
+        try:
+            _unregister_shared_memory_attachment(entry.shm_name, shm)
+        except Exception:
+            pass
 
         try:
             return bytes(shm.buf[: entry.payload_size])
