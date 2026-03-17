@@ -238,7 +238,13 @@ def _run_exact_live_demo(
     exact_reuse_runs: list[dict[str, Any]] = []
     baseline_latency_seconds = float(warm_baseline_run["latency_seconds"])
     for reuse_idx in range(reuse_turns):
-        reset_probe_state(llm)
+        # Keep the saved request registry and backing store intact across reuse
+        # turns so the live demo measures true connector-backed reloads.
+        reset_probe_state(
+            llm,
+            clear_store=False,
+            clear_saved_requests=False,
+        )
         exact_reuse = _run_timed_request(
             llm,
             prompt_exact_input,

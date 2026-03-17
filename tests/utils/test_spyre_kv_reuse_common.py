@@ -10,6 +10,7 @@ if str(EXAMPLES_DIR) not in sys.path:
 from spyre_kv_reuse_common import (
     build_aligned_reuse_token_prompts,
     build_token_sequence,
+    reset_probe_state,
     round_down_to_block,
     round_up_to_block,
 )
@@ -79,3 +80,54 @@ def test_round_down_to_block_rejects_non_positive_block_size():
 def test_round_up_to_block_rejects_non_positive_block_size():
     with pytest.raises(ValueError, match="block_size must be positive"):
         round_up_to_block(128, 0)
+
+
+def test_reset_probe_state_forwards_clear_flags(monkeypatch):
+    scheduler_calls = []
+    worker_calls = []
+
+    class _FakeConnector:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def reset_probe_state(
+            self,
+            *,
+            clear_store=True,
+            clear_saved_requests=True,
+            clear_metrics=True,
+        ):
+            self.calls.append(
+                {
+                    "clear_store": clear_store,
+                    "clear_saved_requests": clear_saved_requests,
+                    "clear_metrics": clear_metrics,
+                }
+            )
+
+    monkeypatch.setattr(
+        "spyre_kv_reuse_common.get_scheduler_connector",
+        lambda llm: _FakeConnector(scheduler_calls),
+    )
+    monkeypatch.setattr(
+        "spyre_kv_reuse_common.get_worker_connector",
+        lambda: _FakeConnector(worker_calls),
+    )
+    monkeypatch.setattr("spyre_kv_reuse_common.drain_scheduler_stats", lambda llm: {})
+
+    reset_probe_state(
+        object(),
+        clear_store=False,
+        clear_saved_requests=False,
+        clear_metrics=True,
+    )
+
+    expected = [
+        {
+            "clear_store": False,
+            "clear_saved_requests": False,
+            "clear_metrics": True,
+        }
+    ]
+    assert scheduler_calls == expected
+    assert worker_calls == expected

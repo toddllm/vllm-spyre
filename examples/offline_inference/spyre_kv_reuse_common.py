@@ -243,7 +243,13 @@ def diff_counts(after: Mapping[str, int], before: Mapping[str, int]) -> dict[str
     }
 
 
-def reset_probe_state(llm) -> None:
+def reset_probe_state(
+    llm,
+    *,
+    clear_store: bool = True,
+    clear_saved_requests: bool = True,
+    clear_metrics: bool = True,
+) -> None:
     seen_ids: set[int] = set()
     for connector in (get_scheduler_connector(llm), get_worker_connector()):
         if connector is None:
@@ -256,7 +262,11 @@ def reset_probe_state(llm) -> None:
 
         reset = getattr(connector, "reset_probe_state", None)
         if callable(reset):
-            reset()
+            reset(
+                clear_store=clear_store,
+                clear_saved_requests=clear_saved_requests,
+                clear_metrics=clear_metrics,
+            )
 
     # Flush any already-snapshotted scheduler stats between scenarios.
     drain_scheduler_stats(llm)
