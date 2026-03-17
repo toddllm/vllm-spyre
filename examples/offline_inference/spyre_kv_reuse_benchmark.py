@@ -120,6 +120,7 @@ def main() -> int:
     parser.add_argument("--revision", type=str, default=None)
     parser.add_argument("--backend", type=str, default="sendnn")
     parser.add_argument("--store-backend", type=str, default="host_memory")
+    parser.add_argument("--store-max-bytes", type=int, default=0)
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--max-num-seqs", type=int, default=4)
     parser.add_argument("--max-num-batched-tokens", type=int, default=128)
@@ -136,6 +137,7 @@ def main() -> int:
     os.environ.setdefault("VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE", "1")
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     os.environ["VLLM_SPYRE_KV_STORE_BACKEND"] = args.store_backend
+    os.environ["VLLM_SPYRE_KV_STORE_MAX_BYTES"] = str(args.store_max_bytes)
     set_local_dist_defaults()
 
     import vllm_spyre
@@ -251,6 +253,7 @@ def main() -> int:
             "revision": args.revision,
             "backend": args.backend,
             "store_backend": args.store_backend,
+            "store_max_bytes": args.store_max_bytes,
             "block_size": block_size,
             "repeats": args.repeats,
             "prompt_exact_tokens": len(prompt_exact_tokens),

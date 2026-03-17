@@ -115,6 +115,12 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         self._blocks_missing = 0
         self._stats = SpyreConnectorStats()
 
+    def _prune_saved_request(self, req_id: str, *, remove_store: bool = False) -> bool:
+        removed = self._saved_requests.pop(req_id, None) is not None
+        if remove_store:
+            self._store.remove_by_req(req_id)
+        return removed
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         self._kv_caches = kv_caches
         if kv_caches:
@@ -289,10 +295,19 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         prompt_tuple = tuple(prompt)
         best_match: _SavedRequest | None = None
         best_tokens_total = 0
+        stale_request_ids: list[str] = []
 
         for saved in self._saved_requests.values():
             saved_len = len(saved.prompt_token_ids)
             if saved_len == 0:
+                continue
+
+            available_blocks = self._store.available_prefix_blocks(
+                saved.req_id,
+                saved.block_ids,
+            )
+            if available_blocks < len(saved.block_ids):
+                stale_request_ids.append(saved.req_id)
                 continue
 
             common_len = 0
@@ -305,6 +320,9 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             if aligned > best_tokens_total:
                 best_tokens_total = aligned
                 best_match = saved
+
+        for req_id in stale_request_ids:
+            self._prune_saved_request(req_id)
 
         if best_match is None or best_tokens_total == 0:
             self._pending_load_sources.pop(request.request_id, None)
@@ -417,6 +435,14 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
     ) -> tuple[bool, dict[str, Any] | None]:
         prompt = request.prompt_token_ids
         if prompt and block_ids:
+            available_blocks = self._store.available_prefix_blocks(
+                request.request_id,
+                block_ids,
+            )
+            if available_blocks < len(block_ids):
+                self._store.remove_by_req(request.request_id)
+                return False, None
+
             saved = _SavedRequest(
                 req_id=request.request_id,
                 prompt_token_ids=tuple(prompt),
@@ -429,7 +455,8 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
 
             if self._saved_requests_max_size > 0:
                 while len(self._saved_requests) > self._saved_requests_max_size:
-                    self._saved_requests.popitem(last=False)
+                    oldest_req_id, _ = self._saved_requests.popitem(last=False)
+                    self._store.remove_by_req(oldest_req_id)
                     self._stats.record("evictions")
 
         return False, None

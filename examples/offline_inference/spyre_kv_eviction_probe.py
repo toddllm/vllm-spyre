@@ -1,12 +1,12 @@
 """
-Probe Spyre KV connector reuse in a single-process offline LLM run.
+Probe request-granular KV store eviction under the current Spyre connector path.
 
-This is intentionally narrow:
+This intentionally stays narrow:
 - `InMemorySpyreConnector`
 - configurable store backend under the connector
-- `kv_both`
+- request-granular store pressure via `VLLM_SPYRE_KV_STORE_MAX_BYTES`
 - single-process (`VLLM_ENABLE_V1_MULTIPROCESSING=0`)
-- built-in prefix caching disabled, so reuse comes from the connector path
+- built-in prefix caching disabled, so any reuse comes from the connector path
 """
 
 from __future__ import annotations
@@ -18,8 +18,6 @@ from typing import Any
 
 from spyre_kv_reuse_common import (
     build_run_metadata,
-    build_prompt,
-    common_prefix_len,
     diff_counts,
     drain_scheduler_stats,
     get_worker_probe_state,
@@ -27,12 +25,22 @@ from spyre_kv_reuse_common import (
 )
 
 
+def _build_distinct_prompt(tokenizer, min_tokens: int, label: str, tail: str) -> str:
+    base = (
+        f"Spyre KV eviction probe for request family {label}. "
+        f"This prompt intentionally repeats a distinct family marker for {label}. "
+    )
+    prompt = base
+    while len(tokenizer.encode(prompt)) < min_tokens:
+        prompt += base
+    return prompt + tail
+
+
 def _run_once(llm, prompt: str, sampling_params, label: str) -> dict[str, Any]:
     worker_before, store_before = get_worker_probe_state()
     _ = llm.generate([prompt], sampling_params, use_tqdm=False)
     scheduler_stats = drain_scheduler_stats(llm)
     worker_after, store_after = get_worker_probe_state()
-
     return {
         "label": label,
         "scheduler_stats": scheduler_stats,
@@ -52,13 +60,13 @@ def main() -> int:
     parser.add_argument("--revision", type=str, default=None)
     parser.add_argument("--backend", type=str, default="sendnn")
     parser.add_argument("--store-backend", type=str, default="host_memory")
-    parser.add_argument("--store-max-bytes", type=int, default=0)
+    parser.add_argument("--store-max-bytes", type=int, default=4_500_000)
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--max-num-seqs", type=int, default=4)
     parser.add_argument("--max-num-batched-tokens", type=int, default=128)
     parser.add_argument("--max-new-tokens", type=int, default=8)
-    parser.add_argument("--shared-prefix-tokens", type=int, default=192)
-    parser.add_argument("--no-assert-reuse", action="store_true")
+    parser.add_argument("--prompt-min-tokens", type=int, default=192)
+    parser.add_argument("--no-assert-eviction", action="store_true")
     args = parser.parse_args()
 
     os.environ.setdefault("VLLM_SPYRE_DYNAMO_BACKEND", args.backend)
@@ -85,7 +93,6 @@ def main() -> int:
         "max_model_len": args.max_model_len,
         "max_num_seqs": args.max_num_seqs,
         "max_num_batched_tokens": args.max_num_batched_tokens,
-        # Disable built-in prefix caching so reuse comes through the connector.
         "enable_prefix_caching": False,
         "kv_transfer_config": {
             "kv_connector": "InMemorySpyreConnector",
@@ -100,23 +107,23 @@ def main() -> int:
 
     try:
         tokenizer = llm.get_tokenizer()
-        prompt_exact = build_prompt(
+        prompt_a = _build_distinct_prompt(
             tokenizer,
-            args.shared_prefix_tokens,
-            tail="\n\nQuestion: Summarize the long prefix in one sentence.",
+            args.prompt_min_tokens,
+            label="alpha",
+            tail="\n\nQuestion: Summarize the alpha family prompt in one sentence.",
         )
-        prompt_partial = build_prompt(
+        prompt_b = _build_distinct_prompt(
             tokenizer,
-            args.shared_prefix_tokens,
-            tail="\n\nQuestion: List three keywords from the long prefix.",
+            args.prompt_min_tokens,
+            label="beta",
+            tail="\n\nQuestion: Summarize the beta family prompt in one sentence.",
         )
 
-        prompt_exact_tokens = tokenizer.encode(prompt_exact)
-        prompt_partial_tokens = tokenizer.encode(prompt_partial)
-        common_prefix_tokens = common_prefix_len(prompt_exact_tokens, prompt_partial_tokens)
+        prompt_a_tokens = tokenizer.encode(prompt_a)
+        prompt_b_tokens = tokenizer.encode(prompt_b)
         block_size = int(llm.llm_engine.vllm_config.cache_config.block_size)
 
-        # Discard any setup-time stats so the probe only reflects request traffic.
         _ = drain_scheduler_stats(llm)
 
         sampling_params = SamplingParams(
@@ -125,9 +132,9 @@ def main() -> int:
             ignore_eos=True,
         )
 
-        warm = _run_once(llm, prompt_exact, sampling_params, "warm_store")
-        exact = _run_once(llm, prompt_exact, sampling_params, "exact_reuse")
-        partial = _run_once(llm, prompt_partial, sampling_params, "partial_reuse")
+        warm_a = _run_once(llm, prompt_a, sampling_params, "warm_a")
+        warm_b = _run_once(llm, prompt_b, sampling_params, "warm_b")
+        replay_a = _run_once(llm, prompt_a, sampling_params, "replay_a_after_eviction")
 
         summary = {
             "run_metadata": build_run_metadata(__file__),
@@ -137,35 +144,27 @@ def main() -> int:
             "store_backend": args.store_backend,
             "store_max_bytes": args.store_max_bytes,
             "block_size": block_size,
-            "prompt_exact_tokens": len(prompt_exact_tokens),
-            "prompt_partial_tokens": len(prompt_partial_tokens),
-            "common_prefix_tokens": common_prefix_tokens,
-            "warm_store": warm,
-            "exact_reuse": exact,
-            "partial_reuse": partial,
+            "prompt_a_tokens": len(prompt_a_tokens),
+            "prompt_b_tokens": len(prompt_b_tokens),
+            "warm_a": warm_a,
+            "warm_b": warm_b,
+            "replay_a_after_eviction": replay_a,
         }
         print(json.dumps(summary, indent=2, sort_keys=True))
 
-        if not args.no_assert_reuse:
-            exact_loaded = exact["worker_delta"].get("blocks_loaded", 0)
-            exact_missing = exact["worker_delta"].get("blocks_missing", 0)
-            partial_loaded = partial["worker_delta"].get("blocks_loaded", 0)
-            partial_missing = partial["worker_delta"].get("blocks_missing", 0)
-
-            if warm["worker_delta"].get("blocks_saved", 0) <= 0:
-                raise SystemExit(
-                    "Probe failed: warm request did not save any connector entries."
-                )
-            if exact_loaded <= 0 or exact_missing > 0:
-                raise SystemExit(
-                    "Probe failed: exact replay did not show connector reuse."
-                )
-            if common_prefix_tokens >= block_size and (
-                partial_loaded <= 0 or partial_missing > 0
-            ):
-                raise SystemExit(
-                    "Probe failed: partial-prefix replay did not show connector reuse."
-                )
+        if not args.no_assert_eviction:
+            if warm_a["worker_delta"].get("blocks_saved", 0) <= 0:
+                raise SystemExit("Eviction probe failed: warm_a did not save any connector entries.")
+            if warm_b["worker_delta"].get("blocks_saved", 0) <= 0:
+                raise SystemExit("Eviction probe failed: warm_b did not save any connector entries.")
+            if warm_b["store_after"].get("evictions", 0) <= warm_a["store_after"].get("evictions", 0):
+                raise SystemExit("Eviction probe failed: warm_b did not trigger store eviction.")
+            if replay_a["worker_delta"].get("blocks_loaded", 0) != 0:
+                raise SystemExit("Eviction probe failed: replay_a unexpectedly loaded evicted blocks.")
+            if replay_a["worker_delta"].get("blocks_missing", 0) != 0:
+                raise SystemExit("Eviction probe failed: replay_a hit load misses instead of clean fallback.")
+            if replay_a["worker_delta"].get("blocks_saved", 0) <= 0:
+                raise SystemExit("Eviction probe failed: replay_a did not fall back to saving the request again.")
 
         return 0
     finally:

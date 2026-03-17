@@ -85,6 +85,28 @@ def _make_blocks(block_ids):
     return blocks
 
 
+def _store_complete_block(
+    store,
+    req_id: str,
+    block_id: int,
+    *,
+    layer_idx: int = 0,
+    dtype: torch.dtype = torch.float32,
+):
+    k = torch.full((2, 2, 4), float(block_id + 1), dtype=dtype)
+    v = torch.full((2, 2, 4), float(block_id + 101), dtype=dtype)
+    store.put(
+        StoreKey(req_id=req_id, layer_idx=layer_idx, block_id=block_id, kv_kind=KVKind.K),
+        k,
+        source_req=req_id,
+    )
+    store.put(
+        StoreKey(req_id=req_id, layer_idx=layer_idx, block_id=block_id, kv_kind=KVKind.V),
+        v,
+        source_req=req_id,
+    )
+
+
 def _make_fake_scheduler_output(kv_connector_metadata=None, finished_req_ids=None):
     so = MagicMock()
     so.kv_connector_metadata = kv_connector_metadata
@@ -176,6 +198,23 @@ class TestMetadataSchema:
     def test_build_spyre_kv_store_backend_rejects_unknown_name(self):
         with pytest.raises(ValueError, match="Unknown Spyre KV store backend"):
             build_spyre_kv_store_backend("not-a-real-backend")
+
+    @pytest.mark.parametrize(
+        "backend_cls",
+        [HostMemoryKVStoreBackend, SerializedHostMemoryKVStoreBackend],
+    )
+    def test_store_max_bytes_evicts_oldest_request_as_whole_unit(self, backend_cls):
+        store = backend_cls(max_bytes=128)
+
+        _store_complete_block(store, "req-A", 0)
+        assert store.available_prefix_blocks("req-A", [0]) == 1
+
+        _store_complete_block(store, "req-B", 0)
+
+        assert store.available_prefix_blocks("req-A", [0]) == 0
+        assert store.available_prefix_blocks("req-B", [0]) == 1
+        assert store.stats()["unique_requests"] == 1
+        assert store.stats()["evictions"] == 1
 
     def test_reset_global_store_uses_selected_backend(self, monkeypatch: pytest.MonkeyPatch):
         from vllm_spyre.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector import (
@@ -326,6 +365,8 @@ class TestInMemorySpyreConnector:
         prompt_a = [10, 20, 30, 40, 50, 60, 70, 80]
         prompt_b = [10, 20, 30, 40, 50, 99, 98]
 
+        _store_complete_block(store, "req-A", 0)
+        _store_complete_block(store, "req-A", 1)
         req_a = _make_request("req-A", prompt_a)
         sched.request_finished(req_a, [0, 1])
 
@@ -334,6 +375,53 @@ class TestInMemorySpyreConnector:
 
         assert matched == 4
         assert is_async is False
+
+    def test_request_finished_requires_backing_store_entries(self):
+        store = InMemoryKVStore()
+        sched = _make_connector(store=store, role=KVConnectorRole.SCHEDULER, block_size=4)
+
+        req = _make_request("req-A", [10, 20, 30, 40])
+        sched.request_finished(req, [0])
+
+        assert sched.get_cumulative_metrics()["saved_requests_count"] == 0
+        matched, is_async = sched.get_num_new_matched_tokens(req, 0)
+        assert matched == 0
+        assert is_async is False
+
+    def test_registry_cap_eviction_removes_store_entries(self):
+        store = InMemoryKVStore()
+        sched = _make_connector(store=store, role=KVConnectorRole.SCHEDULER, block_size=4)
+        sched._saved_requests_max_size = 1
+
+        _store_complete_block(store, "req-A", 0)
+        _store_complete_block(store, "req-B", 0)
+
+        sched.request_finished(_make_request("req-A", [10, 20, 30, 40]), [0])
+        sched.request_finished(_make_request("req-B", [50, 60, 70, 80]), [0])
+
+        assert sched.get_cumulative_metrics()["saved_requests_count"] == 1
+        assert store.available_prefix_blocks("req-A", [0]) == 0
+        assert store.available_prefix_blocks("req-B", [0]) == 1
+
+    def test_matcher_prunes_stale_saved_request_after_store_eviction(self):
+        store = InMemoryKVStore(max_bytes=128)
+        sched = _make_connector(store=store, role=KVConnectorRole.SCHEDULER, block_size=4)
+
+        _store_complete_block(store, "req-A", 0)
+        sched.request_finished(_make_request("req-A", [10, 20, 30, 40]), [0])
+        assert sched.get_cumulative_metrics()["saved_requests_count"] == 1
+
+        _store_complete_block(store, "req-B", 0)
+        assert store.available_prefix_blocks("req-A", [0]) == 0
+
+        matched, is_async = sched.get_num_new_matched_tokens(
+            _make_request("req-C", [10, 20, 30, 40]),
+            0,
+        )
+
+        assert matched == 0
+        assert is_async is False
+        assert sched.get_cumulative_metrics()["saved_requests_count"] == 0
 
     def test_reset_probe_state_clears_registry_store_and_metrics(self):
         block_size = 4

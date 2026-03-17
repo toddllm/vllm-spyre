@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 import io
@@ -98,6 +99,9 @@ class SpyreKVStoreBackend(ABC):
 
     @abstractmethod
     def contains(self, key: StoreKey) -> bool: ...
+
+    @abstractmethod
+    def available_prefix_blocks(self, req_id: str, block_ids: list[int]) -> int: ...
 
     @abstractmethod
     def remove_by_req(self, req_id: str) -> int: ...
@@ -229,6 +233,8 @@ class SpyreConnectorMeta(KVConnectorMetadata):
 class HostMemoryKVStoreBackend(SpyreKVStoreBackend):
     def __init__(self, max_bytes: int = 0) -> None:
         self._store: dict[StoreKey, HostMemoryKVEntry] = {}
+        self._request_keys: dict[str, set[StoreKey]] = {}
+        self._request_order: OrderedDict[str, None] = OrderedDict()
         self._version_counter = 0
         self._max_bytes = max(0, max_bytes)
         self._current_bytes = 0
@@ -258,12 +264,23 @@ class HostMemoryKVStoreBackend(SpyreKVStoreBackend):
     def _entry_bytes(entry: HostMemoryKVEntry) -> int:
         return entry.data.nelement() * entry.data.element_size()
 
+    @staticmethod
+    def _request_id_for(key: StoreKey, source_req: str) -> str:
+        return source_req or key.req_id
+
+    def _track_key(self, req_id: str, key: StoreKey) -> None:
+        keys = self._request_keys.setdefault(req_id, set())
+        keys.add(key)
+        self._request_order.pop(req_id, None)
+        self._request_order[req_id] = None
+
     def put(
         self,
         key: StoreKey,
         data: torch.Tensor,
         source_req: str = "",
     ) -> tuple[int, bool]:
+        req_id = self._request_id_for(key, source_req)
         self._version_counter += 1
         version = self._version_counter
         was_overwrite = key in self._store
@@ -283,20 +300,22 @@ class HostMemoryKVStoreBackend(SpyreKVStoreBackend):
 
         if self._max_bytes > 0:
             while self._store and self._current_bytes + entry_size > self._max_bytes:
-                self._evict_oldest()
+                if self._evict_oldest_request(exclude_req_id=req_id) is None:
+                    break
 
         self._store[key] = entry
+        self._track_key(req_id, key)
         self._current_bytes += entry_size
         return version, was_overwrite
 
-    def _evict_oldest(self) -> StoreKey | None:
-        if not self._store:
-            return None
-        oldest_key = next(iter(self._store))
-        oldest_entry = self._store.pop(oldest_key)
-        self._current_bytes -= self._entry_bytes(oldest_entry)
-        self._evictions += 1
-        return oldest_key
+    def _evict_oldest_request(self, exclude_req_id: str | None = None) -> str | None:
+        for req_id in list(self._request_order.keys()):
+            if req_id == exclude_req_id:
+                continue
+            if self.remove_by_req(req_id) > 0:
+                self._evictions += 1
+                return req_id
+        return None
 
     def get(self, key: StoreKey) -> HostMemoryKVEntry | None:
         return self._store.get(key)
@@ -315,24 +334,52 @@ class HostMemoryKVStoreBackend(SpyreKVStoreBackend):
     def contains(self, key: StoreKey) -> bool:
         return key in self._store
 
+    def available_prefix_blocks(self, req_id: str, block_ids: list[int]) -> int:
+        req_keys = self._request_keys.get(req_id)
+        if not req_keys:
+            return 0
+
+        layer_ids = sorted({key.layer_idx for key in req_keys})
+        if not layer_ids:
+            return 0
+
+        available = 0
+        for block_id in block_ids:
+            block_complete = True
+            for layer_idx in layer_ids:
+                for kv_kind in (KVKind.K, KVKind.V):
+                    if StoreKey(req_id, layer_idx, block_id, kv_kind) not in self._store:
+                        block_complete = False
+                        break
+                if not block_complete:
+                    break
+            if not block_complete:
+                break
+            available += 1
+        return available
+
     def remove_by_req(self, req_id: str) -> int:
-        keys = [k for k in self._store if k.req_id == req_id]
+        keys = list(self._request_keys.pop(req_id, ()))
         for key in keys:
-            entry = self._store.pop(key)
-            self._current_bytes -= self._entry_bytes(entry)
+            entry = self._store.pop(key, None)
+            if entry is not None:
+                self._current_bytes -= self._entry_bytes(entry)
+        self._request_order.pop(req_id, None)
         return len(keys)
 
     def clear(self) -> None:
         self._store.clear()
+        self._request_keys.clear()
+        self._request_order.clear()
         self._version_counter = 0
         self._current_bytes = 0
+        self._evictions = 0
 
     def stats(self) -> dict[str, Any]:
-        req_ids = {k.req_id for k in self._store}
         return {
             "backend_name": self.backend_name,
             "total_entries": len(self._store),
-            "unique_requests": len(req_ids),
+            "unique_requests": len(self._request_keys),
             "version_counter": self._version_counter,
             "memory_estimate_bytes": self._current_bytes,
             "max_bytes": self._max_bytes,
@@ -343,6 +390,8 @@ class HostMemoryKVStoreBackend(SpyreKVStoreBackend):
 class SerializedHostMemoryKVStoreBackend(SpyreKVStoreBackend):
     def __init__(self, max_bytes: int = 0) -> None:
         self._store: dict[StoreKey, SerializedHostMemoryKVEntry] = {}
+        self._request_keys: dict[str, set[StoreKey]] = {}
+        self._request_order: OrderedDict[str, None] = OrderedDict()
         self._version_counter = 0
         self._max_bytes = max(0, max_bytes)
         self._current_bytes = 0
@@ -383,12 +432,23 @@ class SerializedHostMemoryKVStoreBackend(SpyreKVStoreBackend):
         buffer = io.BytesIO(entry.payload)
         return torch.load(buffer, map_location="cpu", weights_only=True)
 
+    @staticmethod
+    def _request_id_for(key: StoreKey, source_req: str) -> str:
+        return source_req or key.req_id
+
+    def _track_key(self, req_id: str, key: StoreKey) -> None:
+        keys = self._request_keys.setdefault(req_id, set())
+        keys.add(key)
+        self._request_order.pop(req_id, None)
+        self._request_order[req_id] = None
+
     def put(
         self,
         key: StoreKey,
         data: torch.Tensor,
         source_req: str = "",
     ) -> tuple[int, bool]:
+        req_id = self._request_id_for(key, source_req)
         self._version_counter += 1
         version = self._version_counter
         was_overwrite = key in self._store
@@ -408,20 +468,22 @@ class SerializedHostMemoryKVStoreBackend(SpyreKVStoreBackend):
 
         if self._max_bytes > 0:
             while self._store and self._current_bytes + entry_size > self._max_bytes:
-                self._evict_oldest()
+                if self._evict_oldest_request(exclude_req_id=req_id) is None:
+                    break
 
         self._store[key] = entry
+        self._track_key(req_id, key)
         self._current_bytes += entry_size
         return version, was_overwrite
 
-    def _evict_oldest(self) -> StoreKey | None:
-        if not self._store:
-            return None
-        oldest_key = next(iter(self._store))
-        oldest_entry = self._store.pop(oldest_key)
-        self._current_bytes -= self._entry_bytes(oldest_entry)
-        self._evictions += 1
-        return oldest_key
+    def _evict_oldest_request(self, exclude_req_id: str | None = None) -> str | None:
+        for req_id in list(self._request_order.keys()):
+            if req_id == exclude_req_id:
+                continue
+            if self.remove_by_req(req_id) > 0:
+                self._evictions += 1
+                return req_id
+        return None
 
     def get(self, key: StoreKey) -> HostMemoryKVEntry | None:
         entry = self._store.get(key)
@@ -449,24 +511,52 @@ class SerializedHostMemoryKVStoreBackend(SpyreKVStoreBackend):
     def contains(self, key: StoreKey) -> bool:
         return key in self._store
 
+    def available_prefix_blocks(self, req_id: str, block_ids: list[int]) -> int:
+        req_keys = self._request_keys.get(req_id)
+        if not req_keys:
+            return 0
+
+        layer_ids = sorted({key.layer_idx for key in req_keys})
+        if not layer_ids:
+            return 0
+
+        available = 0
+        for block_id in block_ids:
+            block_complete = True
+            for layer_idx in layer_ids:
+                for kv_kind in (KVKind.K, KVKind.V):
+                    if StoreKey(req_id, layer_idx, block_id, kv_kind) not in self._store:
+                        block_complete = False
+                        break
+                if not block_complete:
+                    break
+            if not block_complete:
+                break
+            available += 1
+        return available
+
     def remove_by_req(self, req_id: str) -> int:
-        keys = [k for k in self._store if k.req_id == req_id]
+        keys = list(self._request_keys.pop(req_id, ()))
         for key in keys:
-            entry = self._store.pop(key)
-            self._current_bytes -= self._entry_bytes(entry)
+            entry = self._store.pop(key, None)
+            if entry is not None:
+                self._current_bytes -= self._entry_bytes(entry)
+        self._request_order.pop(req_id, None)
         return len(keys)
 
     def clear(self) -> None:
         self._store.clear()
+        self._request_keys.clear()
+        self._request_order.clear()
         self._version_counter = 0
         self._current_bytes = 0
+        self._evictions = 0
 
     def stats(self) -> dict[str, Any]:
-        req_ids = {k.req_id for k in self._store}
         return {
             "backend_name": self.backend_name,
             "total_entries": len(self._store),
-            "unique_requests": len(req_ids),
+            "unique_requests": len(self._request_keys),
             "version_counter": self._version_counter,
             "memory_estimate_bytes": self._current_bytes,
             "max_bytes": self._max_bytes,
