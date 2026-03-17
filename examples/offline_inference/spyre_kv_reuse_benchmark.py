@@ -33,6 +33,28 @@ from spyre_kv_reuse_common import (
 )
 
 
+DEMO_PROFILES: dict[str, dict[str, float | int]] = {
+    "watchable": {
+        "shared_prefix_tokens": 448,
+        "max_new_tokens": 1,
+        "repeats": 4,
+        "sleep_between_live_lines": 1.25,
+    },
+    "bigger": {
+        "shared_prefix_tokens": 448,
+        "max_new_tokens": 1,
+        "repeats": 6,
+        "sleep_between_live_lines": 1.50,
+    },
+    "longer": {
+        "shared_prefix_tokens": 448,
+        "max_new_tokens": 4,
+        "repeats": 4,
+        "sleep_between_live_lines": 1.50,
+    },
+}
+
+
 def _clear_store_backend(store_backend: str, service_socket: str | None) -> None:
     from vllm_spyre.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector import (
         reset_global_store,
@@ -97,17 +119,18 @@ def _format_live_result_line(
         if stage == "exact_warmup":
             return f"Warmup (not counted): {latency_seconds:.3f}s"
         if stage == "exact_warm_baseline":
-            return f"Warm baseline: {latency_seconds:.3f}s"
+            return f"Baseline request: {latency_seconds:.3f}s"
         if stage == "exact_reuse":
-            parts = [f"Reuse {turn_index}/{total_turns}: {latency_seconds:.3f}s"]
+            parts = [
+                f"Repeat {turn_index}/{total_turns} using saved prompt work: "
+                f"{latency_seconds:.3f}s"
+            ]
             if baseline_latency_seconds is not None and latency_seconds > 0:
                 saved_ms = 1000.0 * (baseline_latency_seconds - latency_seconds)
-                parts.append(f"saved {saved_ms:.1f} ms")
-                parts.append(
-                    f"{(baseline_latency_seconds / latency_seconds):.2f}x faster"
-                )
+                parts.append(f"{saved_ms:.1f} ms faster")
+                parts.append(f"{(baseline_latency_seconds / latency_seconds):.2f}x faster")
                 if cumulative_saved_ms is not None:
-                    parts.append(f"cumulative {cumulative_saved_ms:.1f} ms")
+                    parts.append(f"total saved {cumulative_saved_ms:.1f} ms")
             return " | ".join(parts)
 
     parts = [
@@ -143,14 +166,18 @@ def _format_live_header(
     prompt_blocks = (prompt_exact_tokens + block_size - 1) // block_size
     if style == "demo":
         return [
-            "Demo: Warm baseline vs exact KV reuse",
+            "Demo: Reusing saved prompt work",
             (
-                f"Prompt: {prompt_exact_tokens} tokens across {prompt_blocks} KV blocks"
-                f" | Generate: {max_new_tokens} token"
+                "We first run one normal request, then repeat the same request "
+                "using saved prompt work."
+            ),
+            (
+                f"Prompt length: {prompt_exact_tokens} tokens across {prompt_blocks} blocks"
+                f" | Response length: {max_new_tokens} token"
                 f"{'' if max_new_tokens == 1 else 's'}"
             ),
             (
-                f"Warmup runs: {warmup_runs} | Reuse turns: {reuse_turns}"
+                f"Warmups: {warmup_runs} | Repeat requests: {reuse_turns}"
                 f" | Pause between lines: {sleep_between_live_lines_s:.2f}s"
             ),
             "",
@@ -196,12 +223,41 @@ def _format_live_footer(
 
     footer = [
         "",
-        f"Total time saved across reuse turns: {cumulative_saved_ms:.1f} ms",
-        f"Average speedup vs warm baseline: {mean_speedup:.2f}x",
+        f"Total time saved across repeat requests: {cumulative_saved_ms:.1f} ms",
+        f"Average speedup vs the baseline request: {mean_speedup:.2f}x",
     ]
     if all_clean:
-        footer.append("Connector reuse verified on every reuse turn.")
+        footer.append("Saved prompt work was reused successfully on every repeat request.")
     return footer
+
+
+def _resolve_demo_settings(args: argparse.Namespace) -> dict[str, Any]:
+    resolved: dict[str, Any] = {
+        "profile": args.demo_profile,
+        "overrides": {},
+    }
+
+    if args.demo_profile is not None:
+        profile_settings = DEMO_PROFILES[args.demo_profile]
+        args.shared_prefix_tokens = int(profile_settings["shared_prefix_tokens"])
+        args.max_new_tokens = int(profile_settings["max_new_tokens"])
+        args.repeats = int(profile_settings["repeats"])
+        args.sleep_between_live_lines = float(profile_settings["sleep_between_live_lines"])
+
+    if args.demo_prompt_tokens is not None:
+        args.shared_prefix_tokens = args.demo_prompt_tokens
+        resolved["overrides"]["shared_prefix_tokens"] = args.demo_prompt_tokens
+    if args.demo_output_tokens is not None:
+        args.max_new_tokens = args.demo_output_tokens
+        resolved["overrides"]["max_new_tokens"] = args.demo_output_tokens
+    if args.demo_reuse_turns is not None:
+        args.repeats = args.demo_reuse_turns
+        resolved["overrides"]["repeats"] = args.demo_reuse_turns
+    if args.demo_pause_seconds is not None:
+        args.sleep_between_live_lines = args.demo_pause_seconds
+        resolved["overrides"]["sleep_between_live_lines"] = args.demo_pause_seconds
+
+    return resolved
 
 
 def _emit_live_lines(lines: list[str]) -> None:
@@ -445,6 +501,15 @@ def main() -> int:
         choices=("paired_benchmark", "warm_baseline_then_reuse"),
         default="paired_benchmark",
     )
+    parser.add_argument(
+        "--demo-profile",
+        choices=tuple(DEMO_PROFILES),
+        default=None,
+    )
+    parser.add_argument("--demo-prompt-tokens", type=int, default=None)
+    parser.add_argument("--demo-output-tokens", type=int, default=None)
+    parser.add_argument("--demo-reuse-turns", type=int, default=None)
+    parser.add_argument("--demo-pause-seconds", type=float, default=None)
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--aligned-prompts", action="store_true")
     parser.add_argument("--exact-only", action="store_true")
@@ -457,6 +522,7 @@ def main() -> int:
     parser.add_argument("--sleep-between-live-lines", type=float, default=0.0)
     parser.add_argument("--no-assert-reuse", action="store_true")
     args = parser.parse_args()
+    resolved_demo_settings = _resolve_demo_settings(args)
 
     if args.repeats <= 0:
         raise SystemExit("--repeats must be >= 1")
@@ -726,6 +792,8 @@ def main() -> int:
             "aligned_prompts": args.aligned_prompts,
             "exact_only": args.exact_only,
             "demo_mode": args.demo_mode,
+            "demo_profile": resolved_demo_settings["profile"],
+            "demo_overrides": resolved_demo_settings["overrides"],
             "warmup_runs": args.warmup_runs,
             "live_output_style": args.live_output_style,
             "sleep_between_live_lines": args.sleep_between_live_lines,

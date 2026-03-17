@@ -7,9 +7,11 @@ if str(EXAMPLES_DIR) not in sys.path:
     sys.path.insert(0, str(EXAMPLES_DIR))
 
 from spyre_kv_reuse_benchmark import (  # noqa: E402
+    DEMO_PROFILES,
     _effective_max_num_batched_tokens,
     _format_live_result_line,
     _prompt_token_count,
+    _resolve_demo_settings,
 )
 
 
@@ -74,7 +76,7 @@ def test_format_live_result_line_demo_style_is_cleaner():
     )
 
     assert line == (
-        "Reuse 1/4: 0.084s | saved 102.1 ms | 2.21x faster | cumulative 102.1 ms"
+        "Repeat 1/4 using saved prompt work: 0.084s | 102.1 ms faster | 2.21x faster | total saved 102.1 ms"
     )
 
 
@@ -137,3 +139,36 @@ def test_effective_max_num_batched_tokens_keeps_requested_value_by_default():
         )
         == 128
     )
+
+
+def test_demo_profiles_define_watchable_bigger_and_longer():
+    assert set(DEMO_PROFILES) == {"watchable", "bigger", "longer"}
+
+
+def test_resolve_demo_settings_applies_profile_and_overrides():
+    class _Args:
+        demo_profile = "watchable"
+        demo_prompt_tokens = 512
+        demo_output_tokens = 2
+        demo_reuse_turns = 5
+        demo_pause_seconds = 1.75
+        shared_prefix_tokens = 192
+        max_new_tokens = 8
+        repeats = 3
+        sleep_between_live_lines = 0.0
+
+    args = _Args()
+
+    resolved = _resolve_demo_settings(args)
+
+    assert resolved["profile"] == "watchable"
+    assert resolved["overrides"] == {
+        "shared_prefix_tokens": 512,
+        "max_new_tokens": 2,
+        "repeats": 5,
+        "sleep_between_live_lines": 1.75,
+    }
+    assert args.shared_prefix_tokens == 512
+    assert args.max_new_tokens == 2
+    assert args.repeats == 5
+    assert args.sleep_between_live_lines == 1.75
