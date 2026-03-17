@@ -9,6 +9,7 @@ if str(EXAMPLES_DIR) not in sys.path:
 
 from spyre_kv_reuse_common import (
     build_aligned_reuse_token_prompts,
+    build_token_sequence_from_chunks,
     build_token_sequence,
     reset_probe_state,
     round_down_to_block,
@@ -19,12 +20,17 @@ from spyre_kv_reuse_common import (
 class _FakeTokenizer:
     all_special_ids = [0, 1]
 
+    def __init__(self):
+        self._vocab = {}
+
     def encode(self, text, add_special_tokens=False):
-        if "aligned shared prefix" in text:
-            return [11, 12, 13, 14]
-        if "Divergent partial tail" in text:
-            return [21, 22, 23]
-        return [31, 32]
+        tokens = text.split()
+        ids = []
+        for token in tokens:
+            if token not in self._vocab:
+                self._vocab[token] = len(self._vocab) + 10
+            ids.append(self._vocab[token])
+        return ids
 
 
 def test_round_down_to_block():
@@ -44,10 +50,23 @@ def test_round_up_to_block():
 def test_build_token_sequence_returns_exact_token_count():
     tokenizer = _FakeTokenizer()
 
-    token_ids = build_token_sequence(tokenizer, 10, "aligned shared prefix")
+    token_ids = build_token_sequence(tokenizer, 10, "aligned shared prefix seed")
 
     assert len(token_ids) == 10
-    assert token_ids == [11, 12, 13, 14, 11, 12, 13, 14, 11, 12]
+    assert token_ids[:4] == token_ids[4:8]
+    assert token_ids[8:] == token_ids[:2]
+
+
+def test_build_token_sequence_from_chunks_returns_exact_token_count():
+    tokenizer = _FakeTokenizer()
+
+    token_ids = build_token_sequence_from_chunks(
+        tokenizer,
+        9,
+        ["hello there", "general kenobi now"],
+    )
+
+    assert len(token_ids) == 9
 
 
 def test_build_aligned_reuse_token_prompts_produces_exact_reuse_case():
@@ -68,6 +87,7 @@ def test_build_aligned_reuse_token_prompts_produces_exact_reuse_case():
         prompt_data["partial_prompt_token_ids"][:192]
         == prompt_data["prefill_prompt_token_ids"]
     )
+    assert prompt_data["prefill_prompt_token_ids"][-1] in prompt_data["prefill_prompt_token_ids"]
     assert prompt_data["exact_prompt_recompute_tokens"] == 0
     assert prompt_data["partial_prompt_recompute_tokens"] == 15
 

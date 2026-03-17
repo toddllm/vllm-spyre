@@ -565,6 +565,19 @@ def main() -> int:
     )
     parser.add_argument("--demo-prompt-tokens", type=int, default=None)
     parser.add_argument(
+        "--demo-scenario",
+        type=str,
+        default="a neighborhood science fair for families",
+    )
+    parser.add_argument(
+        "--demo-question",
+        type=str,
+        default=(
+            "Write a short invitation that makes the event sound welcoming, "
+            "practical, and fun."
+        ),
+    )
+    parser.add_argument(
         "--demo-response-tokens",
         "--demo-output-tokens",
         dest="demo_response_tokens",
@@ -660,6 +673,8 @@ def main() -> int:
                 requested_shared_prefix_tokens=args.shared_prefix_tokens,
                 block_size=probe_block_size,
                 partial_tail_tokens=args.partial_tail_tokens,
+                scenario_text=args.demo_scenario,
+                question_text=args.demo_question,
             )
             prompt_exact_tokens = prompt_data["prefill_prompt_token_ids"]
             prompt_partial_tokens = prompt_data["partial_prompt_token_ids"]
@@ -874,6 +889,8 @@ def main() -> int:
             "warmup_runs": args.warmup_runs,
             "live_output_style": args.live_output_style,
             "demo_show_text": args.demo_show_text,
+            "demo_scenario": args.demo_scenario,
+            "demo_question": args.demo_question,
             "demo_prompt_preview_chars": args.demo_prompt_preview_chars,
             "demo_answer_preview_chars": args.demo_answer_preview_chars,
             "sleep_between_live_lines": args.sleep_between_live_lines,

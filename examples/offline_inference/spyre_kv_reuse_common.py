@@ -130,12 +130,51 @@ def build_token_sequence(tokenizer, num_tokens: int, seed_text: str) -> list[int
     return seed_ids * repeats + seed_ids[:remainder]
 
 
+def build_token_sequence_from_chunks(
+    tokenizer,
+    num_tokens: int,
+    text_chunks: list[str],
+) -> list[int]:
+    if num_tokens < 0:
+        raise ValueError("num_tokens must be non-negative")
+    if num_tokens == 0:
+        return []
+    if not text_chunks:
+        raise ValueError("text_chunks must not be empty")
+
+    special_ids = set(getattr(tokenizer, "all_special_ids", ()))
+    token_ids: list[int] = []
+    chunk_idx = 0
+    while len(token_ids) < num_tokens:
+        chunk = text_chunks[chunk_idx % len(text_chunks)]
+        chunk_token_ids = [
+            token_id
+            for token_id in tokenizer.encode(chunk, add_special_tokens=False)
+            if token_id not in special_ids
+        ]
+        if not chunk_token_ids:
+            raise ValueError("Each text chunk must tokenize to at least one non-special token")
+        token_ids.extend(chunk_token_ids)
+        chunk_idx += 1
+
+    return token_ids[:num_tokens]
+
+
 def build_aligned_reuse_token_prompts(
     tokenizer,
     *,
     requested_shared_prefix_tokens: int,
     block_size: int,
     partial_tail_tokens: int,
+    scenario_text: str = "a neighborhood science fair for families",
+    question_text: str = (
+        "Write a short invitation that makes the event sound welcoming,"
+        " practical, and fun."
+    ),
+    partial_tail_text: str = (
+        "Mention one hands-on activity, one practical detail, and one reason "
+        "a parent might say yes."
+    ),
 ) -> dict[str, Any]:
     aligned_shared_prefix_tokens = round_down_to_block(
         requested_shared_prefix_tokens,
@@ -144,15 +183,38 @@ def build_aligned_reuse_token_prompts(
     if aligned_shared_prefix_tokens == 0:
         aligned_shared_prefix_tokens = block_size
 
-    shared_prefix_ids = build_token_sequence(
-        tokenizer,
-        aligned_shared_prefix_tokens,
-        " Spyre KV aligned shared prefix.",
-    )
+    question_ids = [
+        token_id
+        for token_id in tokenizer.encode(
+            f"\n\nQuestion: {question_text}",
+            add_special_tokens=False,
+        )
+        if token_id not in set(getattr(tokenizer, "all_special_ids", ()))
+    ]
+    if not question_ids:
+        raise ValueError("question_text must tokenize to at least one non-special token")
+
+    if len(question_ids) >= aligned_shared_prefix_tokens:
+        shared_prefix_ids = question_ids[:aligned_shared_prefix_tokens]
+    else:
+        context_budget = aligned_shared_prefix_tokens - len(question_ids)
+        context_chunks = [
+            f"Context: The team is preparing materials for {scenario_text}. ",
+            "Visitors want a clear sense of what will happen, who it is for, and why it is worth showing up. ",
+            "The tone should be friendly, concrete, and easy to picture. ",
+            "Good answers mention atmosphere, a useful detail, and one memorable reason to attend. ",
+        ]
+        context_ids = build_token_sequence_from_chunks(
+            tokenizer,
+            context_budget,
+            context_chunks,
+        )
+        shared_prefix_ids = context_ids + question_ids
+
     partial_tail_ids = build_token_sequence(
         tokenizer,
         max(0, partial_tail_tokens),
-        " Divergent partial tail for KV reuse demo.",
+        f" Additional guidance: {partial_tail_text}",
     )
 
     prefill_prompt_ids = list(shared_prefix_ids)
