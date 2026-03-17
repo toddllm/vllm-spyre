@@ -54,6 +54,28 @@ def test_format_live_result_line_includes_speedup_when_baseline_provided():
     assert "speedup_vs_baseline=4.000x" in line
 
 
+def test_format_live_result_line_includes_cumulative_saved_time_when_provided():
+    line = _format_live_result_line(
+        stage="exact_reuse",
+        turn_index=3,
+        total_turns=6,
+        run={
+            "latency_seconds": 0.2,
+            "output_tokens": 1,
+            "worker_delta": {
+                "blocks_loaded": 48,
+                "blocks_missing": 0,
+                "blocks_saved": 48,
+            },
+        },
+        baseline_latency_seconds=0.5,
+        cumulative_saved_ms=725.0,
+    )
+
+    assert "saved_ms=300.000" in line
+    assert "cumulative_saved_ms=725.000" in line
+
+
 def test_effective_max_num_batched_tokens_rounds_up_for_aligned_prompts():
     assert (
         _effective_max_num_batched_tokens(

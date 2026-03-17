@@ -87,6 +87,7 @@ def _format_live_result_line(
     total_turns: int,
     run: dict[str, Any],
     baseline_latency_seconds: float | None = None,
+    cumulative_saved_ms: float | None = None,
 ) -> str:
     worker_delta = run["worker_delta"]
     parts = [
@@ -104,7 +105,14 @@ def _format_live_result_line(
             "speedup_vs_baseline="
             f"{(baseline_latency_seconds / float(run['latency_seconds'])):.3f}x"
         )
+        if cumulative_saved_ms is not None:
+            parts.append(f"cumulative_saved_ms={cumulative_saved_ms:.3f}")
     return " ".join(parts)
+
+
+def _sleep_between_live_lines(seconds: float) -> None:
+    if seconds > 0:
+        time.sleep(seconds)
 
 
 def _run_timed_request(llm, prompt_input: Any, sampling_params, label: str) -> dict[str, Any]:
@@ -195,8 +203,25 @@ def _run_exact_live_demo(
     warmup_runs: int,
     reuse_turns: int,
     print_live: bool,
+    sleep_between_live_lines_s: float,
+    prompt_exact_tokens: int,
+    block_size: int,
+    max_new_tokens: int,
 ) -> dict[str, Any]:
     warmup_runs_data: list[dict[str, Any]] = []
+    if print_live:
+        prompt_blocks = (prompt_exact_tokens + block_size - 1) // block_size
+        print(
+            "live_demo "
+            f"prompt_tokens={prompt_exact_tokens} "
+            f"prompt_blocks={prompt_blocks} "
+            f"max_new_tokens={max_new_tokens} "
+            f"warmup_runs={warmup_runs} "
+            f"reuse_turns={reuse_turns} "
+            f"sleep_between_live_lines_s={sleep_between_live_lines_s:.3f}"
+        )
+        _sleep_between_live_lines(sleep_between_live_lines_s)
+
     for warmup_idx in range(warmup_runs):
         _clear_store_backend(store_backend, service_socket)
         reset_probe_state(llm)
@@ -216,6 +241,7 @@ def _run_exact_live_demo(
                     run=warmup_run,
                 )
             )
+            _sleep_between_live_lines(sleep_between_live_lines_s)
 
     _clear_store_backend(store_backend, service_socket)
     reset_probe_state(llm)
@@ -234,9 +260,11 @@ def _run_exact_live_demo(
                 run=warm_baseline_run,
             )
         )
+        _sleep_between_live_lines(sleep_between_live_lines_s)
 
     exact_reuse_runs: list[dict[str, Any]] = []
     baseline_latency_seconds = float(warm_baseline_run["latency_seconds"])
+    cumulative_saved_ms = 0.0
     for reuse_idx in range(reuse_turns):
         # Keep the saved request registry and backing store intact across reuse
         # turns so the live demo measures true connector-backed reloads.
@@ -251,6 +279,12 @@ def _run_exact_live_demo(
             sampling_params,
             "exact_reuse",
         )
+        saved_ms = 1000.0 * (
+            baseline_latency_seconds - float(exact_reuse["latency_seconds"])
+        )
+        cumulative_saved_ms += saved_ms
+        exact_reuse["saved_ms_vs_baseline"] = saved_ms
+        exact_reuse["cumulative_saved_ms_vs_baseline"] = cumulative_saved_ms
         exact_reuse_runs.append(exact_reuse)
         if print_live:
             print(
@@ -260,8 +294,10 @@ def _run_exact_live_demo(
                     total_turns=reuse_turns,
                     run=exact_reuse,
                     baseline_latency_seconds=baseline_latency_seconds,
+                    cumulative_saved_ms=cumulative_saved_ms,
                 )
             )
+            _sleep_between_live_lines(sleep_between_live_lines_s)
 
     return {
         "warmup_runs": warmup_runs_data,
@@ -300,6 +336,7 @@ def main() -> int:
     parser.add_argument("--aligned-prompts", action="store_true")
     parser.add_argument("--exact-only", action="store_true")
     parser.add_argument("--print-live", action="store_true")
+    parser.add_argument("--sleep-between-live-lines", type=float, default=0.0)
     parser.add_argument("--no-assert-reuse", action="store_true")
     args = parser.parse_args()
 
@@ -307,6 +344,8 @@ def main() -> int:
         raise SystemExit("--repeats must be >= 1")
     if args.warmup_runs < 0:
         raise SystemExit("--warmup-runs must be >= 0")
+    if args.sleep_between_live_lines < 0:
+        raise SystemExit("--sleep-between-live-lines must be >= 0")
 
     os.environ.setdefault("VLLM_SPYRE_DYNAMO_BACKEND", args.backend)
     os.environ.setdefault("VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE", "1")
@@ -448,6 +487,10 @@ def main() -> int:
                 warmup_runs=args.warmup_runs,
                 reuse_turns=args.repeats,
                 print_live=args.print_live,
+                sleep_between_live_lines_s=args.sleep_between_live_lines,
+                prompt_exact_tokens=len(prompt_exact_tokens),
+                block_size=block_size,
+                max_new_tokens=args.max_new_tokens,
             )
             exact_cold_runs = [live_demo["warm_baseline"]]
             exact_reuse_runs = list(live_demo["reuse_runs"])
@@ -559,6 +602,7 @@ def main() -> int:
             "exact_only": args.exact_only,
             "demo_mode": args.demo_mode,
             "warmup_runs": args.warmup_runs,
+            "sleep_between_live_lines": args.sleep_between_live_lines,
             "fit_prompt_in_single_prefill": args.fit_prompt_in_single_prefill,
             "block_size": block_size,
             "repeats": args.repeats,
