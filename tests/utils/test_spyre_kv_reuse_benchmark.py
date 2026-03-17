@@ -7,6 +7,7 @@ if str(EXAMPLES_DIR) not in sys.path:
     sys.path.insert(0, str(EXAMPLES_DIR))
 
 from spyre_kv_reuse_benchmark import (  # noqa: E402
+    _effective_max_num_batched_tokens,
     _format_live_result_line,
     _prompt_token_count,
 )
@@ -49,4 +50,29 @@ def test_format_live_result_line_includes_speedup_when_baseline_provided():
     assert "exact_reuse[2/5]" in line
     assert "latency_s=0.100000" in line
     assert "blocks_loaded=16" in line
-    assert "speedup_vs_cold=4.000x" in line
+    assert "saved_ms=300.000" in line
+    assert "speedup_vs_baseline=4.000x" in line
+
+
+def test_effective_max_num_batched_tokens_rounds_up_for_aligned_prompts():
+    assert (
+        _effective_max_num_batched_tokens(
+            requested_tokens=128,
+            required_tokens=385,
+            block_size=64,
+            aligned_prompts=True,
+        )
+        == 448
+    )
+
+
+def test_effective_max_num_batched_tokens_keeps_requested_non_aligned_value():
+    assert (
+        _effective_max_num_batched_tokens(
+            requested_tokens=256,
+            required_tokens=180,
+            block_size=64,
+            aligned_prompts=False,
+        )
+        == 256
+    )

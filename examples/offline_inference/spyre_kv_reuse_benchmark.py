@@ -33,6 +33,24 @@ from spyre_kv_reuse_common import (
 )
 
 
+def _clear_store_backend(store_backend: str, service_socket: str | None) -> None:
+    from vllm_spyre.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector import (
+        reset_global_store,
+    )
+    from vllm_spyre.distributed.kv_transfer.kv_connector.v1.persistent_kv_service import (
+        PersistentKVServiceClient,
+    )
+
+    if service_socket:
+        client = PersistentKVServiceClient(service_socket)
+        try:
+            client.clear()
+        finally:
+            client.close()
+
+    reset_global_store(store_backend)
+
+
 def _prompt_token_count(prompt_input: Any, tokenizer) -> int:
     if hasattr(prompt_input, "get"):
         prompt_token_ids = prompt_input.get("prompt_token_ids")
@@ -43,6 +61,19 @@ def _prompt_token_count(prompt_input: Any, tokenizer) -> int:
         return len(tokenizer.encode(prompt_input))
 
     raise TypeError(f"Unsupported prompt input type: {type(prompt_input)!r}")
+
+
+def _effective_max_num_batched_tokens(
+    *,
+    requested_tokens: int,
+    required_tokens: int,
+    block_size: int,
+    aligned_prompts: bool,
+) -> int:
+    effective = max(requested_tokens, required_tokens)
+    if aligned_prompts:
+        return ((effective + block_size - 1) // block_size) * block_size
+    return effective
 
 
 def _format_live_result_line(
@@ -63,8 +94,10 @@ def _format_live_result_line(
         f"blocks_saved={int(worker_delta.get('blocks_saved', 0))}",
     ]
     if baseline_latency_seconds is not None and float(run["latency_seconds"]) > 0:
+        saved_ms = 1000.0 * (baseline_latency_seconds - float(run["latency_seconds"]))
+        parts.append(f"saved_ms={saved_ms:.3f}")
         parts.append(
-            "speedup_vs_cold="
+            "speedup_vs_baseline="
             f"{(baseline_latency_seconds / float(run['latency_seconds'])):.3f}x"
         )
     return " ".join(parts)
@@ -148,6 +181,85 @@ def _validate_run(run: dict[str, Any], *, expect_load: bool, expect_save: bool, 
         raise SystemExit(f"Benchmark failed: {label} did not save any connector entries.")
 
 
+def _run_exact_live_demo(
+    *,
+    llm,
+    prompt_exact_input: Any,
+    sampling_params,
+    store_backend: str,
+    service_socket: str | None,
+    warmup_runs: int,
+    reuse_turns: int,
+    print_live: bool,
+) -> dict[str, Any]:
+    warmup_runs_data: list[dict[str, Any]] = []
+    for warmup_idx in range(warmup_runs):
+        _clear_store_backend(store_backend, service_socket)
+        reset_probe_state(llm)
+        warmup_run = _run_timed_request(
+            llm,
+            prompt_exact_input,
+            sampling_params,
+            "exact_warmup",
+        )
+        warmup_runs_data.append(warmup_run)
+        if print_live:
+            print(
+                _format_live_result_line(
+                    stage="exact_warmup",
+                    turn_index=warmup_idx + 1,
+                    total_turns=warmup_runs,
+                    run=warmup_run,
+                )
+            )
+
+    _clear_store_backend(store_backend, service_socket)
+    reset_probe_state(llm)
+    warm_baseline_run = _run_timed_request(
+        llm,
+        prompt_exact_input,
+        sampling_params,
+        "exact_warm_baseline",
+    )
+    if print_live:
+        print(
+            _format_live_result_line(
+                stage="exact_warm_baseline",
+                turn_index=1,
+                total_turns=1,
+                run=warm_baseline_run,
+            )
+        )
+
+    exact_reuse_runs: list[dict[str, Any]] = []
+    baseline_latency_seconds = float(warm_baseline_run["latency_seconds"])
+    for reuse_idx in range(reuse_turns):
+        reset_probe_state(llm)
+        exact_reuse = _run_timed_request(
+            llm,
+            prompt_exact_input,
+            sampling_params,
+            "exact_reuse",
+        )
+        exact_reuse_runs.append(exact_reuse)
+        if print_live:
+            print(
+                _format_live_result_line(
+                    stage="exact_reuse",
+                    turn_index=reuse_idx + 1,
+                    total_turns=reuse_turns,
+                    run=exact_reuse,
+                    baseline_latency_seconds=baseline_latency_seconds,
+                )
+            )
+
+    return {
+        "warmup_runs": warmup_runs_data,
+        "warm_baseline": warm_baseline_run,
+        "reuse_runs": exact_reuse_runs,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -168,6 +280,12 @@ def main() -> int:
     parser.add_argument("--shared-prefix-tokens", type=int, default=192)
     parser.add_argument("--partial-tail-tokens", type=int, default=16)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--demo-mode",
+        choices=("paired_benchmark", "warm_baseline_then_reuse"),
+        default="paired_benchmark",
+    )
+    parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--aligned-prompts", action="store_true")
     parser.add_argument("--exact-only", action="store_true")
     parser.add_argument("--print-live", action="store_true")
@@ -176,6 +294,8 @@ def main() -> int:
 
     if args.repeats <= 0:
         raise SystemExit("--repeats must be >= 1")
+    if args.warmup_runs < 0:
+        raise SystemExit("--warmup-runs must be >= 0")
 
     os.environ.setdefault("VLLM_SPYRE_DYNAMO_BACKEND", args.backend)
     os.environ.setdefault("VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE", "1")
@@ -192,44 +312,36 @@ def main() -> int:
 
     from vllm import LLM, SamplingParams
     from vllm.inputs import TokensPrompt
-    from vllm_spyre.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector import (
-        reset_global_store,
-    )
-    from vllm_spyre.distributed.kv_transfer.kv_connector.v1.persistent_kv_service import (
-        PersistentKVServiceClient,
-    )
 
-    if args.clear_service and args.service_socket:
-        client = PersistentKVServiceClient(args.service_socket)
-        try:
-            client.clear()
-        finally:
-            client.close()
+    if args.clear_service or args.demo_mode == "warm_baseline_then_reuse":
+        _clear_store_backend(args.store_backend, args.service_socket)
+    else:
+        _clear_store_backend(args.store_backend, None)
 
-    reset_global_store(args.store_backend)
-
-    llm_kwargs: dict[str, Any] = {
+    tokenizer_probe_kwargs: dict[str, Any] = {
         "model": args.model,
         "tokenizer": args.model,
-        "max_model_len": args.max_model_len,
-        "max_num_seqs": args.max_num_seqs,
-        "max_num_batched_tokens": args.max_num_batched_tokens,
-        "enable_prefix_caching": False,
-        "kv_transfer_config": {
-            "kv_connector": "InMemorySpyreConnector",
-            "kv_role": "kv_both",
-        },
     }
     if args.revision:
-        llm_kwargs["revision"] = args.revision
-        llm_kwargs["tokenizer_revision"] = args.revision
+        tokenizer_probe_kwargs["revision"] = args.revision
+        tokenizer_probe_kwargs["tokenizer_revision"] = args.revision
 
-    llm_init_started = time.perf_counter()
-    llm = LLM(**llm_kwargs)
-    llm_init_elapsed_s = time.perf_counter() - llm_init_started
-
+    probe_llm = LLM(
+        **{
+            **tokenizer_probe_kwargs,
+            "max_model_len": args.max_model_len,
+            "max_num_seqs": args.max_num_seqs,
+            "max_num_batched_tokens": args.max_num_batched_tokens,
+            "enable_prefix_caching": False,
+            "kv_transfer_config": {
+                "kv_connector": "InMemorySpyreConnector",
+                "kv_role": "kv_both",
+            },
+        }
+    )
     try:
-        tokenizer = llm.get_tokenizer()
+        tokenizer = probe_llm.get_tokenizer()
+        probe_block_size = int(probe_llm.llm_engine.vllm_config.cache_config.block_size)
         exact_prompt_recompute_tokens = None
         partial_prompt_recompute_tokens = None
         requested_shared_prefix_tokens = args.shared_prefix_tokens
@@ -238,7 +350,7 @@ def main() -> int:
             prompt_data = build_aligned_reuse_token_prompts(
                 tokenizer,
                 requested_shared_prefix_tokens=args.shared_prefix_tokens,
-                block_size=int(llm.llm_engine.vllm_config.cache_config.block_size),
+                block_size=probe_block_size,
                 partial_tail_tokens=args.partial_tail_tokens,
             )
             prompt_exact_tokens = prompt_data["prefill_prompt_token_ids"]
@@ -261,7 +373,40 @@ def main() -> int:
             )
             prompt_exact_tokens = tokenizer.encode(prompt_exact_input)
             prompt_partial_tokens = tokenizer.encode(prompt_partial_input)
+    finally:
+        probe_llm.llm_engine.engine_core.shutdown()
 
+    required_prompt_tokens = len(prompt_exact_tokens)
+    if not args.exact_only:
+        required_prompt_tokens = max(required_prompt_tokens, len(prompt_partial_tokens))
+    effective_max_num_batched_tokens = _effective_max_num_batched_tokens(
+        requested_tokens=args.max_num_batched_tokens,
+        required_tokens=required_prompt_tokens,
+        block_size=probe_block_size,
+        aligned_prompts=args.aligned_prompts,
+    )
+
+    llm_kwargs: dict[str, Any] = {
+        "model": args.model,
+        "tokenizer": args.model,
+        "max_model_len": args.max_model_len,
+        "max_num_seqs": args.max_num_seqs,
+        "max_num_batched_tokens": effective_max_num_batched_tokens,
+        "enable_prefix_caching": False,
+        "kv_transfer_config": {
+            "kv_connector": "InMemorySpyreConnector",
+            "kv_role": "kv_both",
+        },
+    }
+    if args.revision:
+        llm_kwargs["revision"] = args.revision
+        llm_kwargs["tokenizer_revision"] = args.revision
+
+    llm_init_started = time.perf_counter()
+    llm = LLM(**llm_kwargs)
+    llm_init_elapsed_s = time.perf_counter() - llm_init_started
+
+    try:
         common_prefix_tokens = common_prefix_len(prompt_exact_tokens, prompt_partial_tokens)
         block_size = int(llm.llm_engine.vllm_config.cache_config.block_size)
         aligned_common_prefix_tokens = (common_prefix_tokens // block_size) * block_size
@@ -280,93 +425,107 @@ def main() -> int:
         partial_seed_runs: list[dict[str, Any]] = []
         partial_reuse_runs: list[dict[str, Any]] = []
 
-        for repeat_idx in range(args.repeats):
-            reset_probe_state(llm)
-            exact_cold = _run_timed_request(
-                llm,
-                prompt_exact_input,
-                sampling_params,
-                "exact_cold",
+        live_demo = None
+        if args.demo_mode == "warm_baseline_then_reuse":
+            live_demo = _run_exact_live_demo(
+                llm=llm,
+                prompt_exact_input=prompt_exact_input,
+                sampling_params=sampling_params,
+                store_backend=args.store_backend,
+                service_socket=args.service_socket,
+                warmup_runs=args.warmup_runs,
+                reuse_turns=args.repeats,
+                print_live=args.print_live,
             )
-            exact_reuse = _run_timed_request(
-                llm,
-                prompt_exact_input,
-                sampling_params,
-                "exact_reuse",
-            )
-            exact_cold_runs.append(exact_cold)
-            exact_reuse_runs.append(exact_reuse)
-            if args.print_live:
-                print(
-                    _format_live_result_line(
-                        stage="exact_cold",
-                        turn_index=repeat_idx + 1,
-                        total_turns=args.repeats,
-                        run=exact_cold,
-                    )
+            exact_cold_runs = [live_demo["warm_baseline"]]
+            exact_reuse_runs = list(live_demo["reuse_runs"])
+        else:
+            for repeat_idx in range(args.repeats):
+                reset_probe_state(llm)
+                exact_cold = _run_timed_request(
+                    llm,
+                    prompt_exact_input,
+                    sampling_params,
+                    "exact_cold",
                 )
-                print(
-                    _format_live_result_line(
-                        stage="exact_reuse",
-                        turn_index=repeat_idx + 1,
-                        total_turns=args.repeats,
-                        run=exact_reuse,
-                        baseline_latency_seconds=float(exact_cold["latency_seconds"]),
-                    )
+                exact_reuse = _run_timed_request(
+                    llm,
+                    prompt_exact_input,
+                    sampling_params,
+                    "exact_reuse",
                 )
+                exact_cold_runs.append(exact_cold)
+                exact_reuse_runs.append(exact_reuse)
+                if args.print_live:
+                    print(
+                        _format_live_result_line(
+                            stage="exact_cold",
+                            turn_index=repeat_idx + 1,
+                            total_turns=args.repeats,
+                            run=exact_cold,
+                        )
+                    )
+                    print(
+                        _format_live_result_line(
+                            stage="exact_reuse",
+                            turn_index=repeat_idx + 1,
+                            total_turns=args.repeats,
+                            run=exact_reuse,
+                            baseline_latency_seconds=float(exact_cold["latency_seconds"]),
+                        )
+                    )
+                if args.exact_only:
+                    continue
 
-            if args.exact_only:
-                continue
-
-            reset_probe_state(llm)
-            partial_cold = _run_timed_request(
-                llm,
-                prompt_partial_input,
-                sampling_params,
-                "partial_cold",
-            )
-            partial_cold_runs.append(partial_cold)
-
-            reset_probe_state(llm)
-            partial_seed = _run_timed_request(
-                llm,
-                prompt_exact_input,
-                sampling_params,
-                "partial_seed",
-            )
-            partial_reuse = _run_timed_request(
-                llm,
-                prompt_partial_input,
-                sampling_params,
-                "partial_reuse",
-            )
-            partial_seed_runs.append(partial_seed)
-            partial_reuse_runs.append(partial_reuse)
-            if args.print_live:
-                print(
-                    _format_live_result_line(
-                        stage="partial_cold",
-                        turn_index=repeat_idx + 1,
-                        total_turns=args.repeats,
-                        run=partial_cold,
-                    )
+                reset_probe_state(llm)
+                partial_cold = _run_timed_request(
+                    llm,
+                    prompt_partial_input,
+                    sampling_params,
+                    "partial_cold",
                 )
-                print(
-                    _format_live_result_line(
-                        stage="partial_reuse",
-                        turn_index=repeat_idx + 1,
-                        total_turns=args.repeats,
-                        run=partial_reuse,
-                        baseline_latency_seconds=float(partial_cold["latency_seconds"]),
-                    )
+                partial_cold_runs.append(partial_cold)
+
+                reset_probe_state(llm)
+                partial_seed = _run_timed_request(
+                    llm,
+                    prompt_exact_input,
+                    sampling_params,
+                    "partial_seed",
                 )
+                partial_reuse = _run_timed_request(
+                    llm,
+                    prompt_partial_input,
+                    sampling_params,
+                    "partial_reuse",
+                )
+                partial_seed_runs.append(partial_seed)
+                partial_reuse_runs.append(partial_reuse)
+                if args.print_live:
+                    print(
+                        _format_live_result_line(
+                            stage="partial_cold",
+                            turn_index=repeat_idx + 1,
+                            total_turns=args.repeats,
+                            run=partial_cold,
+                        )
+                    )
+                    print(
+                        _format_live_result_line(
+                            stage="partial_reuse",
+                            turn_index=repeat_idx + 1,
+                            total_turns=args.repeats,
+                            run=partial_reuse,
+                            baseline_latency_seconds=float(partial_cold["latency_seconds"]),
+                        )
+                    )
 
         if not args.no_assert_reuse:
             for run in exact_cold_runs:
                 _validate_run(run, expect_load=False, expect_save=True, label=run["label"])
             for run in exact_reuse_runs:
                 _validate_run(run, expect_load=True, expect_save=False, label=run["label"])
-            if not args.exact_only:
+            if not args.exact_only and args.demo_mode != "warm_baseline_then_reuse":
                 for run in partial_cold_runs:
                     _validate_run(run, expect_load=False, expect_save=True, label=run["label"])
                 for run in partial_seed_runs:
@@ -386,8 +545,12 @@ def main() -> int:
             "store_max_bytes": args.store_max_bytes,
             "aligned_prompts": args.aligned_prompts,
             "exact_only": args.exact_only,
+            "demo_mode": args.demo_mode,
+            "warmup_runs": args.warmup_runs,
             "block_size": block_size,
             "repeats": args.repeats,
+            "requested_max_num_batched_tokens": args.max_num_batched_tokens,
+            "effective_max_num_batched_tokens": effective_max_num_batched_tokens,
             "prompt_exact_tokens": _prompt_token_count(prompt_exact_input, tokenizer),
             "prompt_partial_tokens": _prompt_token_count(prompt_partial_input, tokenizer),
             "common_prefix_tokens": common_prefix_tokens,
@@ -403,6 +566,14 @@ def main() -> int:
                 "exact_reuse_vs_exact_cold": _compare_latency(exact_cold_runs, exact_reuse_runs),
             },
         }
+        if live_demo is not None:
+            summary["live_demo"] = {
+                "warmup_runs": _summarize_runs(live_demo["warmup_runs"])
+                if live_demo["warmup_runs"]
+                else None,
+                "warm_baseline": live_demo["warm_baseline"],
+                "reuse_runs": _summarize_runs(live_demo["reuse_runs"]),
+            }
         if not args.exact_only:
             summary["scenarios"]["partial_cold"] = _summarize_runs(partial_cold_runs)
             summary["scenarios"]["partial_seed"] = _summarize_runs(partial_seed_runs)
