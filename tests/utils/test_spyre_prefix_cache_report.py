@@ -7,6 +7,8 @@ if str(EXAMPLES_DIR) not in sys.path:
     sys.path.insert(0, str(EXAMPLES_DIR))
 
 from spyre_prefix_cache_report import (  # noqa: E402
+    _get_metrics,
+    _metric_delta,
     _parse_cases,
     _ratio,
     render_markdown,
@@ -21,6 +23,52 @@ def test_ratio_handles_zero_expected_hits():
     assert _ratio(0, 0) == 1.0
     assert _ratio(1, 0) == 0.0
     assert _ratio(96, 192) == 0.5
+
+
+def test_metric_delta_handles_labeled_metrics():
+    before = {
+        "vllm:prefix_cache_queries_total": 128.0,
+        "vllm:prefix_cache_hits_total": 64.0,
+    }
+    after = {
+        "vllm:prefix_cache_queries_total": 378.0,
+        "vllm:prefix_cache_hits_total": 192.0,
+    }
+
+    assert _metric_delta(
+        before,
+        after,
+        "vllm:prefix_cache_queries_total",
+        "vllm:prefix_cache_queries",
+    ) == 250
+    assert _metric_delta(
+        before,
+        after,
+        "vllm:prefix_cache_hits_total",
+        "vllm:prefix_cache_hits",
+    ) == 128
+
+
+def test_get_metrics_strips_labels_and_sums_series(monkeypatch):
+    class DummyResponse:
+        text = """
+# HELP vllm:prefix_cache_hits_total ...
+vllm:prefix_cache_hits_total{model_name=\"a\"} 64
+vllm:prefix_cache_hits_total{model_name=\"b\"} 32
+vllm:prefix_cache_queries_total{model_name=\"a\"} 128
+"""
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(
+        "spyre_prefix_cache_report.requests.get",
+        lambda *args, **kwargs: DummyResponse(),
+    )
+
+    metrics = _get_metrics("http://localhost:8000")
+    assert metrics["vllm:prefix_cache_hits_total"] == 96.0
+    assert metrics["vllm:prefix_cache_queries_total"] == 128.0
 
 
 def test_render_markdown_includes_tables_and_summary():

@@ -154,11 +154,23 @@ def _get_metrics(server_root: str) -> dict[str, float]:
         if " " not in line:
             continue
         name, value = line.rsplit(" ", 1)
+        base_name = name.split("{", 1)[0]
         try:
-            metrics[name] = float(value)
+            metrics[base_name] = metrics.get(base_name, 0.0) + float(value)
         except ValueError:
             continue
     return metrics
+
+
+def _metric_delta(
+    before: dict[str, float],
+    after: dict[str, float],
+    *candidate_names: str,
+) -> int:
+    for metric_name in candidate_names:
+        if metric_name in before or metric_name in after:
+            return int(after.get(metric_name, 0.0) - before.get(metric_name, 0.0))
+    return 0
 
 
 def _reset_prefix_cache(server_root: str) -> None:
@@ -265,10 +277,18 @@ def _run_case(
     )
     metrics_after = _get_metrics(server_root)
 
-    query_metric = "vllm:prefix_cache_queries_total"
-    hit_metric = "vllm:prefix_cache_hits_total"
-    observed_queries = int(metrics_after.get(query_metric, 0) - metrics_before.get(query_metric, 0))
-    observed_hits = int(metrics_after.get(hit_metric, 0) - metrics_before.get(hit_metric, 0))
+    observed_queries = _metric_delta(
+        metrics_before,
+        metrics_after,
+        "vllm:prefix_cache_queries_total",
+        "vllm:prefix_cache_queries",
+    )
+    observed_hits = _metric_delta(
+        metrics_before,
+        metrics_after,
+        "vllm:prefix_cache_hits_total",
+        "vllm:prefix_cache_hits",
+    )
 
     return {
         "kind": "partial" if partial else "exact",
