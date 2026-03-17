@@ -158,10 +158,11 @@ class TestMetadataSchema:
         assert store.load_into(key, dest) is True
         assert torch.equal(dest, source)
 
-    def test_serialized_host_memory_store_backend_loads_into_destination_tensor(self):
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_serialized_host_memory_store_backend_loads_into_destination_tensor(self, dtype):
         store = SerializedHostMemoryKVStoreBackend()
         key = StoreKey(req_id="req-1", layer_idx=0, block_id=0, kv_kind=KVKind.K)
-        source = torch.arange(16, dtype=torch.float32).reshape(2, 2, 4)
+        source = torch.arange(16, dtype=torch.float32).reshape(2, 2, 4).to(dtype)
 
         version, was_overwrite = store.put(key, source, source_req="req-1")
         assert version == 1

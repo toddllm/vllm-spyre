@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
+import io
 from typing import Any
 
 import torch
@@ -106,14 +107,6 @@ class SpyreKVStoreBackend(ABC):
 
     @abstractmethod
     def stats(self) -> dict[str, Any]: ...
-
-
-def _dtype_from_str(dtype_str: str) -> torch.dtype:
-    dtype_name = dtype_str.removeprefix("torch.")
-    dtype = getattr(torch, dtype_name, None)
-    if not isinstance(dtype, torch.dtype):
-        raise ValueError(f"Unsupported dtype string '{dtype_str}'")
-    return dtype
 
 
 @dataclass
@@ -381,12 +374,14 @@ class SerializedHostMemoryKVStoreBackend(SpyreKVStoreBackend):
 
     @staticmethod
     def _serialize_tensor(data: torch.Tensor) -> bytes:
-        return data.detach().contiguous().cpu().numpy().tobytes()
+        buffer = io.BytesIO()
+        torch.save(data.detach().clone().cpu(), buffer)
+        return buffer.getvalue()
 
     @staticmethod
     def _materialize_tensor(entry: SerializedHostMemoryKVEntry) -> torch.Tensor:
-        source = torch.frombuffer(bytearray(entry.payload), dtype=_dtype_from_str(entry.dtype))
-        return source.reshape(entry.shape)
+        buffer = io.BytesIO(entry.payload)
+        return torch.load(buffer, map_location="cpu", weights_only=True)
 
     def put(
         self,
