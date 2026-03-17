@@ -277,6 +277,35 @@ class TestMetadataSchema:
         envs_spyre.clear_env_cache()
         reset_global_store()
 
+    def test_connector_shutdown_calls_store_shutdown(self):
+        store = MagicMock(spec=HostMemoryKVStoreBackend)
+        store.stats.return_value = {"backend_name": "host_memory"}
+        connector = _make_connector(store=store)
+
+        connector.shutdown()
+
+        store.shutdown.assert_called_once_with()
+
+    def test_connector_shutdown_unlinks_shared_memory_store_segments(self):
+        store = SerializedSharedMemoryKVStoreBackend()
+        connector = _make_connector(store=store)
+        key = StoreKey(req_id="req-1", layer_idx=0, block_id=0, kv_kind=KVKind.K)
+        source = torch.arange(16, dtype=torch.float32).reshape(2, 2, 4)
+
+        try:
+            store.put(key, source, source_req="req-1")
+            entry = store._store[key]
+
+            shm = shared_memory.SharedMemory(name=entry.shm_name, create=False)
+            shm.close()
+
+            connector.shutdown()
+
+            with pytest.raises(FileNotFoundError):
+                shared_memory.SharedMemory(name=entry.shm_name, create=False)
+        finally:
+            store.shutdown()
+
 
 @pytest.mark.cpu
 class TestInMemorySpyreConnector:

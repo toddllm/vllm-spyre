@@ -514,3 +514,4 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
 
     def shutdown(self) -> None:
         logger.info("[InMemorySpyreConnector] Shutdown. Store stats: %s", self._store.stats())
+        self._store.shutdown()
