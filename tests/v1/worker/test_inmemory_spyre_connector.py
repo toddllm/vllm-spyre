@@ -556,11 +556,11 @@ class TestInMemorySpyreConnector:
 
         req_b = _make_request("req-B", prompt_a)
         matched, is_async = sched.get_num_new_matched_tokens(req_b, 0)
-        assert matched == 8
+        assert matched == 7
         assert is_async is False
 
         blocks_b = _make_blocks([4, 5])
-        sched.update_state_after_alloc(req_b, blocks_b, num_external_tokens=8)
+        sched.update_state_after_alloc(req_b, blocks_b, num_external_tokens=7)
         meta_b = sched.build_connector_meta(_make_fake_scheduler_output())
         load_req = meta_b.requests[0]
         assert load_req.is_store is False
@@ -677,7 +677,7 @@ class TestInMemorySpyreConnector:
                 0,
             )
 
-            assert matched == 8
+            assert matched == 7
             assert is_async is False
             assert sched_b.get_cumulative_metrics()["saved_requests_count"] == 1
         finally:
@@ -715,7 +715,7 @@ class TestInMemorySpyreConnector:
             assert consumer.exitcode == 0
             decode_result = result_queue.get(timeout=2.0)
             assert decode_result == {
-                "matched": 8,
+                "matched": 7,
                 "is_async": False,
                 "saved_requests_count": 1,
             }

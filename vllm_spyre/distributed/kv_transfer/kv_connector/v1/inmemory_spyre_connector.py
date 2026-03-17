@@ -366,8 +366,14 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             return 0, False
 
         num_local = max(0, num_computed_tokens)
-        num_external = max(0, best_tokens_total - num_local)
-        num_external = (num_external // self._block_size) * self._block_size
+        if best_tokens_total >= len(prompt_tuple):
+            # Reserve one local token so the base scheduler can transition
+            # from a fully matched prompt into the first decode-producing step.
+            target_total_computed = max(0, len(prompt_tuple) - 1)
+            num_external = max(0, target_total_computed - num_local)
+        else:
+            num_external = max(0, best_tokens_total - num_local)
+            num_external = (num_external // self._block_size) * self._block_size
         if num_external == 0:
             self._pending_load_sources.pop(request.request_id, None)
             self._stats.record("match_attempts")
@@ -412,6 +418,9 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                 local_blocks = pending.num_local_computed_tokens // self._block_size
                 source = pending.source
                 block_mapping: list[tuple[int, int]] = []
+
+                if num_external_tokens % self._block_size != 0:
+                    num_external_blocks += 1
 
                 for i in range(num_external_blocks):
                     src_idx = local_blocks + i
