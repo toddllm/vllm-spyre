@@ -614,6 +614,26 @@ class TestInMemorySpyreConnector:
         assert matched == 0
         assert is_async is False
 
+    def test_request_finished_ignores_non_prompt_tail_blocks(self):
+        store = InMemoryKVStore()
+        sched = _make_connector(store=store, role=KVConnectorRole.SCHEDULER, block_size=4)
+
+        req = _make_request("req-A", [10, 20, 30, 40, 50, 60, 70, 80])
+        _store_complete_block(store, "req-A", 0)
+        _store_complete_block(store, "req-A", 1)
+
+        # Simulate the runtime handing request_finished an extra allocated block
+        # beyond the two prompt blocks that were actually stored.
+        sched.request_finished(req, [0, 1, 2])
+
+        assert sched.get_cumulative_metrics()["saved_requests_count"] == 1
+        matched, is_async = sched.get_num_new_matched_tokens(
+            _make_request("req-B", [10, 20, 30, 40, 50, 60, 70, 80]),
+            0,
+        )
+        assert matched == 7
+        assert is_async is False
+
     def test_registry_cap_eviction_removes_store_entries(self):
         store = InMemoryKVStore()
         sched = _make_connector(store=store, role=KVConnectorRole.SCHEDULER, block_size=4)

@@ -480,18 +480,23 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
     ) -> tuple[bool, dict[str, Any] | None]:
         prompt = request.prompt_token_ids
         if prompt and block_ids:
+            num_prompt_blocks = (len(prompt) + self._block_size - 1) // self._block_size
+            prompt_block_ids = list(block_ids[:num_prompt_blocks])
+            if not prompt_block_ids:
+                return False, None
+
             available_blocks = self._store.available_prefix_blocks(
                 request.request_id,
-                block_ids,
+                prompt_block_ids,
             )
-            if available_blocks < len(block_ids):
+            if available_blocks < len(prompt_block_ids):
                 self._store.remove_by_req(request.request_id)
                 return False, None
 
             saved = SavedRequestRecord(
                 req_id=request.request_id,
                 prompt_token_ids=tuple(prompt),
-                block_ids=list(block_ids),
+                block_ids=prompt_block_ids,
                 num_tokens=len(prompt),
             )
             self._save_request_record(saved)
