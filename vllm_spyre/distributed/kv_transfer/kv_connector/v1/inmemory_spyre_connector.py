@@ -394,7 +394,12 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         blocks: "KVCacheBlocks",
         num_external_tokens: int,
     ) -> None:
-        block_id_lists = blocks.get_block_ids() if blocks is not None else ()
+        if blocks is None:
+            block_id_lists = ()
+        elif hasattr(blocks, "get_block_ids"):
+            block_id_lists = blocks.get_block_ids()
+        else:
+            block_id_lists = tuple(list(group) for group in blocks)
         if block_id_lists:
             assert len(block_id_lists) == 1, (
                 "InMemorySpyreConnector assumes a single KV cache group"

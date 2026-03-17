@@ -273,7 +273,7 @@ class TestSchedulerStructuredOutputHandling:
         mocked_scheduler.ongoing_prefills = [request]
         mocked_scheduler.requests = {request.request_id: request}
         mocked_scheduler.connector = Mock()
-        mocked_scheduler.kv_cache_manager.get_blocks.return_value = "prefill-blocks"
+        mocked_scheduler.kv_cache_manager.get_block_ids.return_value = ([1, 2],)
 
         outputs = Mock()
         outputs.scheduled_cached_reqs = CachedRequestData(
@@ -292,7 +292,7 @@ class TestSchedulerStructuredOutputHandling:
 
         mocked_scheduler.connector.update_state_after_alloc.assert_called_once_with(
             request,
-            "prefill-blocks",
+            ([1, 2],),
             0,
         )
 
@@ -315,7 +315,7 @@ class TestSchedulerStructuredOutputHandling:
         mocked_scheduler.ongoing_prefills = [request]
         mocked_scheduler.requests = {request.request_id: request}
         mocked_scheduler.connector = Mock()
-        mocked_scheduler.kv_cache_manager.get_blocks.return_value = "prefill-blocks"
+        mocked_scheduler.kv_cache_manager.get_block_ids.return_value = ([1, 2, 3, 4],)
 
         outputs = Mock()
         outputs.scheduled_cached_reqs = CachedRequestData.make_empty()
@@ -326,7 +326,49 @@ class TestSchedulerStructuredOutputHandling:
 
         mocked_scheduler.connector.update_state_after_alloc.assert_called_once_with(
             request,
-            "prefill-blocks",
+            ([1, 2, 3, 4],),
+            0,
+        )
+
+    def test_scheduler_merges_new_block_ids_for_final_prefill_chunk(
+        self, mocked_scheduler
+    ):
+        sampling_params = SamplingParams(max_tokens=20, temperature=0.0)
+        request = Request(
+            request_id="prefill_req",
+            sampling_params=sampling_params,
+            prompt_token_ids=list(range(384)),
+            arrival_time=0,
+            lora_request=None,
+            pooling_params=None,
+        )
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens = 256
+
+        mocked_scheduler.running = [request]
+        mocked_scheduler.ongoing_prefills = [request]
+        mocked_scheduler.requests = {request.request_id: request}
+        mocked_scheduler.connector = Mock()
+        mocked_scheduler.kv_cache_manager.get_block_ids.return_value = ([1, 2, 3, 4],)
+
+        outputs = Mock()
+        outputs.scheduled_cached_reqs = CachedRequestData(
+            req_ids=[request.request_id],
+            resumed_req_ids=set(),
+            new_token_ids=[],
+            all_token_ids={},
+            new_block_ids=[([5, 6],)],
+            num_computed_tokens=[256],
+            num_output_tokens=[0],
+        )
+        outputs.num_scheduled_tokens = {request.request_id: 128}
+
+        with patch("vllm.v1.core.sched.scheduler.Scheduler.schedule", return_value=outputs):
+            mocked_scheduler.schedule()
+
+        mocked_scheduler.connector.update_state_after_alloc.assert_called_once_with(
+            request,
+            ([1, 2, 3, 4, 5, 6],),
             0,
         )
 

@@ -364,6 +364,17 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
         if not scheduled_req_ids:
             return
 
+        extra_block_ids_by_req: dict[str, tuple[list[int], ...]] = {}
+        scheduled_cached_reqs = getattr(outputs, "scheduled_cached_reqs", None)
+        if scheduled_cached_reqs is not None:
+            req_ids = list(getattr(scheduled_cached_reqs, "req_ids", ()) or ())
+            new_block_ids = list(getattr(scheduled_cached_reqs, "new_block_ids", ()) or ())
+            for req_id, block_ids in zip(req_ids, new_block_ids):
+                if block_ids:
+                    extra_block_ids_by_req[req_id] = tuple(
+                        list(group) for group in block_ids
+                    )
+
         for request in self.ongoing_prefills:
             req_id = request.request_id
             if req_id not in scheduled_req_ids:
@@ -379,11 +390,18 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
             if tracked_request is None:
                 continue
 
-            self.connector.update_state_after_alloc(
-                tracked_request,
-                self.kv_cache_manager.get_blocks(req_id),
-                0,
+            current_block_ids = tuple(
+                list(group) for group in self.kv_cache_manager.get_block_ids(req_id)
             )
+            extra_block_ids = extra_block_ids_by_req.get(req_id)
+            merged_block_ids = current_block_ids
+            if extra_block_ids is not None:
+                merged_block_ids = tuple(
+                    current + extra
+                    for current, extra in zip(current_block_ids, extra_block_ids)
+                )
+
+            self.connector.update_state_after_alloc(tracked_request, merged_block_ids, 0)
 
     def can_schedule_prefill(self, request: Request) -> bool:
         # running and waiting queues are both empty, we can start a new batch
