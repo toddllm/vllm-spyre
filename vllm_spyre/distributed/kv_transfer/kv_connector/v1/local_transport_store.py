@@ -62,7 +62,8 @@ class UDSProcessKVTransport:
             "/tmp",
             f"spyre-kv-store-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock",
         )
-        self._ctx = get_context("spawn")
+        start_method = "fork" if os.name == "posix" else "spawn"
+        self._ctx = get_context(start_method)
         self._process = self._ctx.Process(
             target=_run_transport_store_server,
             args=(self._socket_path,),
@@ -72,7 +73,7 @@ class UDSProcessKVTransport:
         self._conn = self._connect_with_retry()
 
     def _connect_with_retry(self):
-        deadline = time.time() + 5.0
+        deadline = time.time() + 30.0
         while True:
             try:
                 conn = Client(address=self._socket_path, family="AF_UNIX")
@@ -84,6 +85,8 @@ class UDSProcessKVTransport:
             except FileNotFoundError:
                 pass
             except ConnectionRefusedError:
+                pass
+            except OSError:
                 pass
             if time.time() >= deadline:
                 raise RuntimeError(
