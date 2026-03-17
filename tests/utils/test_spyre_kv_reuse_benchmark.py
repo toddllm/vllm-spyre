@@ -8,6 +8,7 @@ if str(EXAMPLES_DIR) not in sys.path:
 
 from spyre_kv_reuse_benchmark import (  # noqa: E402
     _effective_max_num_batched_tokens,
+    _format_live_header,
     _format_live_result_line,
     _preview_text,
     _prompt_token_count,
@@ -74,12 +75,31 @@ def test_format_live_result_line_demo_style_is_cleaner():
         baseline_latency_seconds=0.186547,
         cumulative_saved_ms=102.073,
         style="demo",
-        prompt_work_status="saved prompt work reused",
+        prompt_work_status="reused the saved prompt",
     )
 
     assert line == (
-        "Repeat 1/4: 0.084s | saved prompt work reused | 102.1 ms faster | 2.21x faster | total saved 102.1 ms"
+        "Repeat 1/4: 0.084s | reused the saved prompt | 102.1 ms faster | 2.21x faster | total saved 102.1 ms"
     )
+
+
+def test_format_live_header_demo_style_mentions_example_and_task():
+    lines = _format_live_header(
+        style="demo",
+        prompt_label="Chicken soup instructions",
+        task_text="Provide a list of instructions for preparing chicken soup.",
+        prompt_exact_tokens=448,
+        block_size=64,
+        max_new_tokens=2,
+        warmup_runs=1,
+        reuse_turns=4,
+        sleep_between_live_lines_s=1.25,
+        prompt_preview="Below is an instruction...",
+    )
+
+    assert "Example: Chicken soup instructions" in lines
+    assert "Task: Provide a list of instructions for preparing chicken soup." in lines
+    assert 'Prompt setup: "Below is an instruction..."' in lines
 
 
 def test_format_live_result_line_includes_cumulative_saved_time_when_provided():
@@ -183,14 +203,14 @@ def test_prompt_work_status_distinguishes_normal_vs_reused():
             {"worker_delta": {"blocks_loaded": 48, "blocks_missing": 0, "blocks_saved": 0}},
             prompt_recompute_tokens=0,
         )
-        == "saved prompt work reused"
+        == "reused the saved prompt"
     )
     assert (
         _prompt_work_status(
             {"worker_delta": {"blocks_loaded": 24, "blocks_missing": 0, "blocks_saved": 24}},
             prompt_recompute_tokens=16,
         )
-        == "partly reused saved prompt work"
+        == "reused part of the saved prompt"
     )
 
 

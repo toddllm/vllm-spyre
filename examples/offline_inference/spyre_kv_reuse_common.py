@@ -30,6 +30,85 @@ BASELINE_ENV_VARS = (
 
 NON_DELTA_METRIC_KEYS = frozenset({"saved_requests_count"})
 
+INSTRUCTION_PROMPT_HEADER = (
+    "Below is an instruction that describes a task. Write a response that "
+    "appropriately completes the request. Be polite in your response to the "
+    "user."
+)
+
+DEMO_PROMPT_TEMPLATES: dict[str, dict[str, Any]] = {
+    "science_fair_invite": {
+        "display_name": "Science fair invitation",
+        "scenario_text": "a neighborhood science fair for families",
+        "instruction_text": (
+            "Write a short invitation that makes the event sound welcoming, "
+            "practical, and fun."
+        ),
+        "partial_tail_text": (
+            "Mention one hands-on activity, one practical detail, and one "
+            "reason a parent might say yes."
+        ),
+        "context_chunks": [
+            "The team is preparing materials for {scenario_text}. ",
+            "Visitors want a clear sense of what will happen, who it is for, and why it is worth showing up. ",
+            "The tone should be friendly, concrete, and easy to picture. ",
+            "Good answers mention atmosphere, a useful detail, and one memorable reason to attend. ",
+        ],
+    },
+    "chicken_soup": {
+        "display_name": "Chicken soup instructions",
+        "instruction_text": "Provide a list of instructions for preparing chicken soup.",
+        "partial_tail_text": (
+            "Include one tip for a richer broth and one simple side dish that pairs well."
+        ),
+        "context_chunks": [
+            "The cook wants clear steps, common ingredients, and a warm, practical tone. ",
+            "Strong answers mention prepping ingredients, simmering the broth, seasoning carefully, and serving suggestions. ",
+            "The result should feel useful to a home cook, not like a restaurant recipe. ",
+        ],
+    },
+    "bedtime_story": {
+        "display_name": "Bedtime story",
+        "instruction_text": (
+            "Tell a gentle bedtime story about a fox who learns to share."
+        ),
+        "partial_tail_text": (
+            "Keep the ending calm, add one memorable image, and avoid anything scary."
+        ),
+        "context_chunks": [
+            "The story is meant for a young child at bedtime. ",
+            "Good answers use simple language, a calm rhythm, and reassuring imagery. ",
+            "The tone should feel soft, warm, and easy to read aloud. ",
+        ],
+    },
+    "power_query_columns": {
+        "display_name": "Power Query help",
+        "instruction_text": (
+            "Explain how to add multiple new columns in M for Power Query or Power BI."
+        ),
+        "partial_tail_text": (
+            "Explain it in very simple terms and include one short example."
+        ),
+        "context_chunks": [
+            "The user is a beginner and wants a plain-language explanation. ",
+            "Helpful answers break the task into steps, mention the UI and the M code, and keep the example short. ",
+            "The response should reduce confusion and sound encouraging. ",
+        ],
+    },
+    "java_char_to_string": {
+        "display_name": "Java char to string",
+        "instruction_text": "Explain how to convert a char to a string in Java.",
+        "partial_tail_text": (
+            "Include one tiny code example and one common mistake to avoid."
+        ),
+        "context_chunks": [
+            "The reader wants a quick, practical programming answer. ",
+            "Good answers mention the main conversion options, show one clear example, and keep jargon light. ",
+            "The response should be concise and easy to copy into code review comments or team chat. ",
+        ],
+    },
+}
+
 
 def set_local_dist_defaults() -> None:
     os.environ.setdefault("MASTER_ADDR", "localhost")
@@ -100,6 +179,82 @@ def build_prompt(tokenizer, min_tokens: int, tail: str) -> str:
     return prompt + tail
 
 
+def get_demo_prompt_template_names() -> tuple[str, ...]:
+    return tuple(DEMO_PROMPT_TEMPLATES.keys())
+
+
+def resolve_demo_prompt_template(
+    template_name: str,
+    *,
+    scenario_text: str | None = None,
+    question_text: str | None = None,
+    partial_tail_text: str | None = None,
+) -> dict[str, Any]:
+    if template_name not in DEMO_PROMPT_TEMPLATES:
+        valid = ", ".join(get_demo_prompt_template_names())
+        raise ValueError(f"Unknown demo template {template_name!r}. Expected one of: {valid}")
+
+    base = DEMO_PROMPT_TEMPLATES[template_name]
+    resolved_scenario = scenario_text or base.get("scenario_text")
+    resolved_instruction = question_text or base["instruction_text"]
+    resolved_tail = partial_tail_text or base["partial_tail_text"]
+
+    context_chunks = [
+        chunk.format(
+            scenario_text=resolved_scenario,
+            instruction_text=resolved_instruction,
+        )
+        for chunk in base["context_chunks"]
+    ]
+
+    return {
+        "template_name": template_name,
+        "display_name": base["display_name"],
+        "scenario_text": resolved_scenario,
+        "instruction_text": resolved_instruction,
+        "partial_tail_text": resolved_tail,
+        "context_chunks": context_chunks,
+        "background_header_text": f"{INSTRUCTION_PROMPT_HEADER}\n\n### Background:\n",
+        "instruction_prefix_text": "\n\n### Instruction:\n",
+        "partial_tail_prefix_text": "\n\n### Extra detail to include:\n",
+    }
+
+
+def build_templated_prompt(
+    tokenizer,
+    min_tokens: int,
+    *,
+    template_name: str,
+    scenario_text: str | None = None,
+    question_text: str | None = None,
+    partial_tail_text: str | None = None,
+    include_partial_tail: bool = False,
+) -> str:
+    template = resolve_demo_prompt_template(
+        template_name,
+        scenario_text=scenario_text,
+        question_text=question_text,
+        partial_tail_text=partial_tail_text,
+    )
+
+    prompt = template["background_header_text"]
+    context_idx = 0
+    while len(tokenizer.encode(prompt)) < min_tokens:
+        prompt += template["context_chunks"][context_idx % len(template["context_chunks"])]
+        context_idx += 1
+
+    prompt += (
+        template["instruction_prefix_text"]
+        + template["instruction_text"]
+    )
+    if include_partial_tail:
+        prompt += (
+            template["partial_tail_prefix_text"]
+            + template["partial_tail_text"]
+        )
+    return prompt
+
+
 def round_down_to_block(tokens: int, block_size: int) -> int:
     if block_size <= 0:
         raise ValueError("block_size must be positive")
@@ -166,15 +321,10 @@ def build_aligned_reuse_token_prompts(
     requested_shared_prefix_tokens: int,
     block_size: int,
     partial_tail_tokens: int,
-    scenario_text: str = "a neighborhood science fair for families",
-    question_text: str = (
-        "Write a short invitation that makes the event sound welcoming,"
-        " practical, and fun."
-    ),
-    partial_tail_text: str = (
-        "Mention one hands-on activity, one practical detail, and one reason "
-        "a parent might say yes."
-    ),
+    template_name: str = "science_fair_invite",
+    scenario_text: str | None = None,
+    question_text: str | None = None,
+    partial_tail_text: str | None = None,
 ) -> dict[str, Any]:
     aligned_shared_prefix_tokens = round_down_to_block(
         requested_shared_prefix_tokens,
@@ -183,44 +333,59 @@ def build_aligned_reuse_token_prompts(
     if aligned_shared_prefix_tokens == 0:
         aligned_shared_prefix_tokens = block_size
 
-    question_ids = [
+    template = resolve_demo_prompt_template(
+        template_name,
+        scenario_text=scenario_text,
+        question_text=question_text,
+        partial_tail_text=partial_tail_text,
+    )
+
+    special_ids = set(getattr(tokenizer, "all_special_ids", ()))
+    header_ids = [
         token_id
         for token_id in tokenizer.encode(
-            f"\n\nQuestion: {question_text}",
+            template["background_header_text"],
             add_special_tokens=False,
         )
-        if token_id not in set(getattr(tokenizer, "all_special_ids", ()))
+        if token_id not in special_ids
     ]
-    if not question_ids:
-        raise ValueError("question_text must tokenize to at least one non-special token")
+    instruction_ids = [
+        token_id
+        for token_id in tokenizer.encode(
+            template["instruction_prefix_text"] + template["instruction_text"],
+            add_special_tokens=False,
+        )
+        if token_id not in special_ids
+    ]
+    if not instruction_ids:
+        raise ValueError("instruction_text must tokenize to at least one non-special token")
 
-    if len(question_ids) >= aligned_shared_prefix_tokens:
-        shared_prefix_ids = question_ids[:aligned_shared_prefix_tokens]
+    if len(header_ids) + len(instruction_ids) >= aligned_shared_prefix_tokens:
+        shared_prefix_ids = (header_ids + instruction_ids)[:aligned_shared_prefix_tokens]
     else:
-        context_budget = aligned_shared_prefix_tokens - len(question_ids)
-        context_chunks = [
-            f"Context: The team is preparing materials for {scenario_text}. ",
-            "Visitors want a clear sense of what will happen, who it is for, and why it is worth showing up. ",
-            "The tone should be friendly, concrete, and easy to picture. ",
-            "Good answers mention atmosphere, a useful detail, and one memorable reason to attend. ",
-        ]
+        context_budget = aligned_shared_prefix_tokens - len(header_ids) - len(instruction_ids)
         context_ids = build_token_sequence_from_chunks(
             tokenizer,
             context_budget,
-            context_chunks,
+            template["context_chunks"],
         )
-        shared_prefix_ids = context_ids + question_ids
+        shared_prefix_ids = header_ids + context_ids + instruction_ids
 
     partial_tail_ids = build_token_sequence(
         tokenizer,
         max(0, partial_tail_tokens),
-        f" Additional guidance: {partial_tail_text}",
+        template["partial_tail_prefix_text"] + template["partial_tail_text"],
     )
 
     prefill_prompt_ids = list(shared_prefix_ids)
     partial_prompt_ids = list(shared_prefix_ids) + list(partial_tail_ids)
 
     return {
+        "demo_template": template["template_name"],
+        "demo_template_display_name": template["display_name"],
+        "scenario_text": template["scenario_text"],
+        "instruction_text": template["instruction_text"],
+        "partial_tail_text": template["partial_tail_text"],
         "requested_shared_prefix_tokens": requested_shared_prefix_tokens,
         "aligned_shared_prefix_tokens": aligned_shared_prefix_tokens,
         "prefill_prompt_token_ids": prefill_prompt_ids,

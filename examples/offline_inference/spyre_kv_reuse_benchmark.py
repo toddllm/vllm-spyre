@@ -22,14 +22,16 @@ from typing import Any
 from spyre_kv_reuse_common import (
     build_aligned_reuse_token_prompts,
     build_run_metadata,
-    build_prompt,
+    build_templated_prompt,
     common_prefix_len,
     diff_counts,
     drain_scheduler_stats,
     extract_output_text,
     extract_output_token_count,
+    get_demo_prompt_template_names,
     get_worker_probe_state,
     reset_probe_state,
+    resolve_demo_prompt_template,
     set_local_dist_defaults,
 )
 
@@ -138,6 +140,8 @@ def _format_live_result_line(
 def _format_live_header(
     *,
     style: str,
+    prompt_label: str | None,
+    task_text: str | None,
     prompt_exact_tokens: int,
     block_size: int,
     max_new_tokens: int,
@@ -149,11 +153,17 @@ def _format_live_header(
     prompt_blocks = (prompt_exact_tokens + block_size - 1) // block_size
     if style == "demo":
         lines = [
-            "Demo: Reusing saved prompt work",
+            "Demo: Reusing a saved prompt",
             (
                 "We first run one normal request, then repeat the same request "
-                "using saved prompt work."
+                "using the saved prompt."
             ),
+        ]
+        if prompt_label:
+            lines.append(f"Example: {prompt_label}")
+        if task_text:
+            lines.append(f"Task: {task_text}")
+        lines.extend([
             (
                 f"Prompt length: {prompt_exact_tokens} tokens across {prompt_blocks} blocks"
                 f" | Response length: {max_new_tokens} token"
@@ -163,9 +173,9 @@ def _format_live_header(
                 f"Warmups: {warmup_runs} | Repeat requests: {reuse_turns}"
                 f" | Pause between lines: {sleep_between_live_lines_s:.2f}s"
             ),
-        ]
+        ])
         if prompt_preview:
-            lines.append(f'Prompt preview: "{prompt_preview}"')
+            lines.append(f'Prompt setup: "{prompt_preview}"')
         lines.append("")
         return lines
 
@@ -213,7 +223,7 @@ def _format_live_footer(
         f"Average speedup vs the baseline request: {mean_speedup:.2f}x",
     ]
     if all_clean:
-        footer.append("Saved prompt work was reused successfully on every repeat request.")
+        footer.append("Every repeated request reused the saved prompt successfully.")
     return footer
 
 
@@ -256,9 +266,9 @@ def _prompt_work_status(run: dict[str, Any], *, prompt_recompute_tokens: int) ->
     saved = int(worker_delta.get("blocks_saved", 0))
 
     if loaded > 0 and missing == 0 and prompt_recompute_tokens == 0:
-        return "saved prompt work reused"
+        return "reused the saved prompt"
     if loaded > 0 and missing == 0 and prompt_recompute_tokens > 0:
-        return "partly reused saved prompt work"
+        return "reused part of the saved prompt"
     if loaded == 0 and saved > 0:
         return "normal run"
     return "reuse not detected"
@@ -384,6 +394,8 @@ def _run_exact_live_demo(
     block_size: int,
     max_new_tokens: int,
     live_output_style: str,
+    prompt_label: str | None,
+    task_text: str | None,
     prompt_preview: str | None,
     answer_preview_chars: int,
 ) -> dict[str, Any]:
@@ -392,6 +404,8 @@ def _run_exact_live_demo(
         _emit_live_lines(
             _format_live_header(
                 style=live_output_style,
+                prompt_label=prompt_label,
+                task_text=task_text,
                 prompt_exact_tokens=prompt_exact_tokens,
                 block_size=block_size,
                 max_new_tokens=max_new_tokens,
@@ -565,17 +579,24 @@ def main() -> int:
     )
     parser.add_argument("--demo-prompt-tokens", type=int, default=None)
     parser.add_argument(
+        "--demo-template",
+        choices=get_demo_prompt_template_names(),
+        default="science_fair_invite",
+    )
+    parser.add_argument(
         "--demo-scenario",
         type=str,
-        default="a neighborhood science fair for families",
+        default=None,
     )
     parser.add_argument(
         "--demo-question",
         type=str,
-        default=(
-            "Write a short invitation that makes the event sound welcoming, "
-            "practical, and fun."
-        ),
+        default=None,
+    )
+    parser.add_argument(
+        "--demo-partial-tail",
+        type=str,
+        default=None,
     )
     parser.add_argument(
         "--demo-response-tokens",
@@ -666,6 +687,12 @@ def main() -> int:
         exact_prompt_recompute_tokens = None
         partial_prompt_recompute_tokens = None
         requested_shared_prefix_tokens = args.shared_prefix_tokens
+        resolved_template = resolve_demo_prompt_template(
+            args.demo_template,
+            scenario_text=args.demo_scenario,
+            question_text=args.demo_question,
+            partial_tail_text=args.demo_partial_tail,
+        )
 
         if args.aligned_prompts:
             prompt_data = build_aligned_reuse_token_prompts(
@@ -673,8 +700,10 @@ def main() -> int:
                 requested_shared_prefix_tokens=args.shared_prefix_tokens,
                 block_size=probe_block_size,
                 partial_tail_tokens=args.partial_tail_tokens,
+                template_name=args.demo_template,
                 scenario_text=args.demo_scenario,
                 question_text=args.demo_question,
+                partial_tail_text=args.demo_partial_tail,
             )
             prompt_exact_tokens = prompt_data["prefill_prompt_token_ids"]
             prompt_partial_tokens = prompt_data["partial_prompt_token_ids"]
@@ -683,19 +712,30 @@ def main() -> int:
             requested_shared_prefix_tokens = prompt_data["requested_shared_prefix_tokens"]
             exact_prompt_recompute_tokens = prompt_data["exact_prompt_recompute_tokens"]
             partial_prompt_recompute_tokens = prompt_data["partial_prompt_recompute_tokens"]
+            prompt_label = prompt_data["demo_template_display_name"]
+            task_text = prompt_data["instruction_text"]
         else:
-            prompt_exact_input = build_prompt(
+            prompt_exact_input = build_templated_prompt(
                 tokenizer,
                 args.shared_prefix_tokens,
-                tail="\n\nQuestion: Summarize the long prefix in one sentence.",
+                template_name=args.demo_template,
+                scenario_text=args.demo_scenario,
+                question_text=args.demo_question,
+                partial_tail_text=args.demo_partial_tail,
             )
-            prompt_partial_input = build_prompt(
+            prompt_partial_input = build_templated_prompt(
                 tokenizer,
                 args.shared_prefix_tokens,
-                tail="\n\nQuestion: List three keywords from the long prefix.",
+                template_name=args.demo_template,
+                scenario_text=args.demo_scenario,
+                question_text=args.demo_question,
+                partial_tail_text=args.demo_partial_tail,
+                include_partial_tail=True,
             )
             prompt_exact_tokens = tokenizer.encode(prompt_exact_input)
             prompt_partial_tokens = tokenizer.encode(prompt_partial_input)
+            prompt_label = resolved_template["display_name"]
+            task_text = resolved_template["instruction_text"]
         prompt_preview = _preview_text(
             tokenizer.decode(prompt_exact_tokens),
             args.demo_prompt_preview_chars,
@@ -769,6 +809,8 @@ def main() -> int:
                 block_size=block_size,
                 max_new_tokens=args.max_new_tokens,
                 live_output_style=args.live_output_style,
+                prompt_label=prompt_label,
+                task_text=task_text,
                 prompt_preview=prompt_preview if args.demo_show_text else None,
                 answer_preview_chars=args.demo_answer_preview_chars,
             )
@@ -889,8 +931,12 @@ def main() -> int:
             "warmup_runs": args.warmup_runs,
             "live_output_style": args.live_output_style,
             "demo_show_text": args.demo_show_text,
+            "demo_template": args.demo_template,
+            "demo_template_display_name": prompt_label,
             "demo_scenario": args.demo_scenario,
             "demo_question": args.demo_question,
+            "demo_partial_tail": args.demo_partial_tail,
+            "resolved_instruction_text": task_text,
             "demo_prompt_preview_chars": args.demo_prompt_preview_chars,
             "demo_answer_preview_chars": args.demo_answer_preview_chars,
             "sleep_between_live_lines": args.sleep_between_live_lines,

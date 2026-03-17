@@ -17,17 +17,20 @@ import os
 from typing import Any
 
 from spyre_kv_reuse_common import (
+    build_aligned_reuse_token_prompts,
     build_run_metadata,
-    build_prompt,
+    build_templated_prompt,
     common_prefix_len,
     diff_counts,
     drain_scheduler_stats,
+    get_demo_prompt_template_names,
     get_worker_probe_state,
+    resolve_demo_prompt_template,
     set_local_dist_defaults,
 )
 
 
-def _run_once(llm, prompt: str, sampling_params, label: str) -> dict[str, Any]:
+def _run_once(llm, prompt: Any, sampling_params, label: str) -> dict[str, Any]:
     worker_before, store_before = get_worker_probe_state()
     _ = llm.generate([prompt], sampling_params, use_tqdm=False)
     scheduler_stats = drain_scheduler_stats(llm)
@@ -59,6 +62,24 @@ def main() -> int:
     parser.add_argument("--max-num-batched-tokens", type=int, default=128)
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--shared-prefix-tokens", type=int, default=192)
+    parser.add_argument("--partial-tail-tokens", type=int, default=16)
+    parser.add_argument(
+        "--demo-template",
+        choices=get_demo_prompt_template_names(),
+        default="science_fair_invite",
+    )
+    parser.add_argument(
+        "--demo-scenario",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--demo-question",
+        type=str,
+        default=None,
+    )
+    parser.add_argument("--demo-partial-tail", type=str, default=None)
+    parser.add_argument("--aligned-prompts", action="store_true")
     parser.add_argument("--no-assert-reuse", action="store_true")
     args = parser.parse_args()
 
@@ -103,19 +124,53 @@ def main() -> int:
 
     try:
         tokenizer = llm.get_tokenizer()
-        prompt_exact = build_prompt(
-            tokenizer,
-            args.shared_prefix_tokens,
-            tail="\n\nQuestion: Summarize the long prefix in one sentence.",
+        resolved_template = resolve_demo_prompt_template(
+            args.demo_template,
+            scenario_text=args.demo_scenario,
+            question_text=args.demo_question,
+            partial_tail_text=args.demo_partial_tail,
         )
-        prompt_partial = build_prompt(
-            tokenizer,
-            args.shared_prefix_tokens,
-            tail="\n\nQuestion: List three keywords from the long prefix.",
-        )
+        if args.aligned_prompts:
+            prompt_data = build_aligned_reuse_token_prompts(
+                tokenizer,
+                requested_shared_prefix_tokens=args.shared_prefix_tokens,
+                block_size=int(llm.llm_engine.vllm_config.cache_config.block_size),
+                partial_tail_tokens=args.partial_tail_tokens,
+                template_name=args.demo_template,
+                scenario_text=args.demo_scenario,
+                question_text=args.demo_question,
+                partial_tail_text=args.demo_partial_tail,
+            )
+            prompt_exact_tokens = prompt_data["prefill_prompt_token_ids"]
+            prompt_partial_tokens = prompt_data["partial_prompt_token_ids"]
+            from vllm.inputs import TokensPrompt
 
-        prompt_exact_tokens = tokenizer.encode(prompt_exact)
-        prompt_partial_tokens = tokenizer.encode(prompt_partial)
+            prompt_exact: Any = TokensPrompt(prompt_token_ids=prompt_exact_tokens)
+            prompt_partial: Any = TokensPrompt(prompt_token_ids=prompt_partial_tokens)
+            prompt_label = prompt_data["demo_template_display_name"]
+            task_text = prompt_data["instruction_text"]
+        else:
+            prompt_exact = build_templated_prompt(
+                tokenizer,
+                args.shared_prefix_tokens,
+                template_name=args.demo_template,
+                scenario_text=args.demo_scenario,
+                question_text=args.demo_question,
+                partial_tail_text=args.demo_partial_tail,
+            )
+            prompt_partial = build_templated_prompt(
+                tokenizer,
+                args.shared_prefix_tokens,
+                template_name=args.demo_template,
+                scenario_text=args.demo_scenario,
+                question_text=args.demo_question,
+                partial_tail_text=args.demo_partial_tail,
+                include_partial_tail=True,
+            )
+            prompt_exact_tokens = tokenizer.encode(prompt_exact)
+            prompt_partial_tokens = tokenizer.encode(prompt_partial)
+            prompt_label = resolved_template["display_name"]
+            task_text = resolved_template["instruction_text"]
         common_prefix_tokens = common_prefix_len(prompt_exact_tokens, prompt_partial_tokens)
         block_size = int(llm.llm_engine.vllm_config.cache_config.block_size)
 
@@ -141,6 +196,13 @@ def main() -> int:
             "service_socket": args.service_socket,
             "store_max_bytes": args.store_max_bytes,
             "block_size": block_size,
+            "aligned_prompts": args.aligned_prompts,
+            "demo_template": args.demo_template,
+            "demo_template_display_name": prompt_label,
+            "demo_scenario": args.demo_scenario,
+            "demo_question": args.demo_question,
+            "demo_partial_tail": args.demo_partial_tail,
+            "resolved_instruction_text": task_text,
             "prompt_exact_tokens": len(prompt_exact_tokens),
             "prompt_partial_tokens": len(prompt_partial_tokens),
             "common_prefix_tokens": common_prefix_tokens,

@@ -20,6 +20,7 @@ from spyre_kv_reuse_common import (
     diff_counts,
     drain_scheduler_stats,
     extract_output_token_count,
+    get_demo_prompt_template_names,
     get_worker_probe_state,
     round_down_to_block,
     round_up_to_block,
@@ -70,6 +71,22 @@ def main() -> int:
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--shared-prefix-tokens", type=int, default=128)
     parser.add_argument("--partial-tail-tokens", type=int, default=16)
+    parser.add_argument(
+        "--demo-template",
+        choices=get_demo_prompt_template_names(),
+        default="science_fair_invite",
+    )
+    parser.add_argument(
+        "--demo-scenario",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--demo-question",
+        type=str,
+        default=None,
+    )
+    parser.add_argument("--demo-partial-tail", type=str, default=None)
     parser.add_argument(
         "--decode-variant",
         choices=("exact", "partial"),
@@ -160,6 +177,10 @@ def main() -> int:
             requested_shared_prefix_tokens=args.shared_prefix_tokens,
             block_size=block_size,
             partial_tail_tokens=args.partial_tail_tokens,
+            template_name=args.demo_template,
+            scenario_text=args.demo_scenario,
+            question_text=args.demo_question,
+            partial_tail_text=args.demo_partial_tail,
         )
         prompt_prefill_tokens = prompt_data["prefill_prompt_token_ids"]
         prompt_partial_tokens = prompt_data["partial_prompt_token_ids"]
@@ -214,6 +235,10 @@ def main() -> int:
             "partial_prompt_tokens": len(prompt_partial_tokens),
             "requested_shared_prefix_tokens": prompt_data["requested_shared_prefix_tokens"],
             "aligned_shared_prefix_tokens": prompt_data["aligned_shared_prefix_tokens"],
+            "demo_template": prompt_data["demo_template"],
+            "demo_template_display_name": prompt_data["demo_template_display_name"],
+            "resolved_instruction_text": prompt_data["instruction_text"],
+            "resolved_partial_tail_text": prompt_data["partial_tail_text"],
             "common_prefix_tokens": common_prefix_tokens,
             "partial_tail_tokens": prompt_data["partial_tail_tokens"],
             "exact_prompt_recompute_tokens": prompt_data["exact_prompt_recompute_tokens"],
