@@ -759,6 +759,19 @@ class ChunkedPrefillModelRunner(
             return None
         return kv_caches[layer_idx]
 
+    def _resolve_connector_copy_pair(
+        self,
+        layer_name: str,
+        registered_pair: tuple[torch.Tensor, torch.Tensor],
+        current_pair: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if current_pair is None:
+            return registered_pair
+
+        if self._connector_kv_pairs is not None:
+            self._connector_kv_pairs[layer_name] = current_pair
+        return current_pair
+
     def _sync_loaded_kv_from_staging(self) -> None:
         if self._connector_kv_staging is None or self._connector_kv_pairs is None:
             return
@@ -818,8 +831,13 @@ class ChunkedPrefillModelRunner(
                         tensor_role="current_model_v",
                         tensor=current_pair[1],
                     )
-            k_cache.copy_(kv_tensor[0])
-            v_cache.copy_(kv_tensor[1])
+            target_k_cache, target_v_cache = self._resolve_connector_copy_pair(
+                layer_name=layer_name,
+                registered_pair=kv_pair,
+                current_pair=current_pair,
+            )
+            target_k_cache.copy_(kv_tensor[0])
+            target_v_cache.copy_(kv_tensor[1])
             if layer_idx is not None:
                 current_pair = self._get_current_model_kv_pair(layer_idx)
                 emit_tensor_probe(
@@ -913,8 +931,13 @@ class ChunkedPrefillModelRunner(
                         tensor_role="current_model_v",
                         tensor=current_pair[1],
                     )
-            kv_tensor[0].copy_(k_cache)
-            kv_tensor[1].copy_(v_cache)
+            source_k_cache, source_v_cache = self._resolve_connector_copy_pair(
+                layer_name=layer_name,
+                registered_pair=kv_pair,
+                current_pair=current_pair,
+            )
+            kv_tensor[0].copy_(source_k_cache)
+            kv_tensor[1].copy_(source_v_cache)
             if layer_idx is not None:
                 emit_tensor_probe(
                     phase="after_save_sync",
