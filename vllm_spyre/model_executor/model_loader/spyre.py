@@ -23,6 +23,7 @@ import vllm_spyre.envs as envs_spyre
 import vllm_spyre.multimodal as spyre_mm
 import vllm_spyre.utils as utils_spyre
 from vllm_spyre.platform import SpyrePlatform
+from vllm_spyre.v1.worker.spyre_kv_semantic_probe import emit_tensor_probe
 
 try:
     import backends.dynamo_tracer  # ty: ignore[unresolved-import] # noqa
@@ -418,6 +419,28 @@ class SpyreCausalLM(nn.Module):
                 input_ids=input_ids_or_embeds, position_ids=positions, attn_metadata=attn_metadata
             )
 
+        probe_layer_idx = int(envs_spyre.VLLM_SPYRE_KV_SEMANTIC_PROBE_LAYER)
+        if (
+            envs_spyre.VLLM_SPYRE_KV_SEMANTIC_PROBE_ENABLED
+            and 0 <= probe_layer_idx < len(self.past_key_value_states)
+        ):
+            layer_name = f"model.layers.{probe_layer_idx}.self_attn"
+            pre_k, pre_v = self.past_key_value_states[probe_layer_idx]
+            emit_tensor_probe(
+                phase="forward_pre_call",
+                layer_idx=probe_layer_idx,
+                layer_name=layer_name,
+                tensor_role="model_pre_k",
+                tensor=pre_k,
+            )
+            emit_tensor_probe(
+                phase="forward_pre_call",
+                layer_idx=probe_layer_idx,
+                layer_name=layer_name,
+                tensor_role="model_pre_v",
+                tensor=pre_v,
+            )
+
         # Run the model
         output = self.fms_model(
             input_ids_or_embeds,
@@ -434,6 +457,27 @@ class SpyreCausalLM(nn.Module):
         )
 
         logits, self.past_key_value_states = output
+
+        if (
+            envs_spyre.VLLM_SPYRE_KV_SEMANTIC_PROBE_ENABLED
+            and 0 <= probe_layer_idx < len(self.past_key_value_states)
+        ):
+            layer_name = f"model.layers.{probe_layer_idx}.self_attn"
+            post_k, post_v = self.past_key_value_states[probe_layer_idx]
+            emit_tensor_probe(
+                phase="forward_post_call",
+                layer_idx=probe_layer_idx,
+                layer_name=layer_name,
+                tensor_role="model_post_k",
+                tensor=post_k,
+            )
+            emit_tensor_probe(
+                phase="forward_post_call",
+                layer_idx=probe_layer_idx,
+                layer_name=layer_name,
+                tensor_role="model_post_v",
+                tensor=post_v,
+            )
 
         if is_prompt:
             # assert that indeed received the last block of logits

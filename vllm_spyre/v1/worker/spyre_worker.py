@@ -41,6 +41,7 @@ import vllm_spyre.perf_metrics as perf_metrics
 import vllm_spyre.utils as utils_spyre
 from vllm_spyre.model_executor.model_loader import spyre_setup
 from vllm_spyre.platform import SpyrePlatform
+from vllm_spyre.v1.worker.spyre_kv_semantic_probe import emit_tensor_probe
 from vllm_spyre.v1.worker.spyre_model_runner import (
     ChunkedPrefillModelRunner,
     SpyrePoolingModelRunner,
@@ -293,6 +294,36 @@ class SpyreWorker(WorkerBase):
             layer_name = f"model.layers.{layer_idx}.self_attn"
             kv_caches_dict[layer_name] = torch.stack([k_cache, v_cache])
             kv_cache_pairs[layer_name] = (k_cache, v_cache)
+            emit_tensor_probe(
+                phase="register",
+                layer_idx=layer_idx,
+                layer_name=layer_name,
+                tensor_role="registered_k",
+                tensor=k_cache,
+            )
+            emit_tensor_probe(
+                phase="register",
+                layer_idx=layer_idx,
+                layer_name=layer_name,
+                tensor_role="registered_v",
+                tensor=v_cache,
+            )
+            emit_tensor_probe(
+                phase="register",
+                layer_idx=layer_idx,
+                layer_name=layer_name,
+                tensor_role="staging_k",
+                tensor=kv_caches_dict[layer_name][0],
+                compare_to=k_cache,
+            )
+            emit_tensor_probe(
+                phase="register",
+                layer_idx=layer_idx,
+                layer_name=layer_name,
+                tensor_role="staging_v",
+                tensor=kv_caches_dict[layer_name][1],
+                compare_to=v_cache,
+            )
 
         self.model_runner.set_connector_kv_cache_staging(
             kv_staging=kv_caches_dict,

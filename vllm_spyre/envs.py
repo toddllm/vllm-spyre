@@ -25,6 +25,11 @@ if TYPE_CHECKING:
     VLLM_SPYRE_KV_STORE_BACKEND: str = "host_memory"
     VLLM_SPYRE_KV_STORE_MAX_BYTES: int = 0
     VLLM_SPYRE_KV_SERVICE_SOCKET: str = "/tmp/spyre-kv-persistent.sock"
+    VLLM_SPYRE_KV_SEMANTIC_PROBE_ENABLED: bool = False
+    VLLM_SPYRE_KV_SEMANTIC_PROBE_LAYER: int = 0
+    VLLM_SPYRE_KV_SEMANTIC_PROBE_BLOCK: int = 0
+    VLLM_SPYRE_KV_SEMANTIC_PROBE_HEAD: int = 0
+    VLLM_SPYRE_KV_SEMANTIC_PROBE_ELEMS: int = 8
 
 logger = init_logger(__name__)
 
@@ -169,6 +174,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # serialized_shared_memory_service backend.
     "VLLM_SPYRE_KV_SERVICE_SOCKET": lambda: os.getenv(
         "VLLM_SPYRE_KV_SERVICE_SOCKET", "/tmp/spyre-kv-persistent.sock"
+    ),
+    # Enable the local-only semantic KV probe used to debug old-stack tensor
+    # identity and value flow around the connector staging surface.
+    "VLLM_SPYRE_KV_SEMANTIC_PROBE_ENABLED": lambda: bool(
+        int(os.getenv("VLLM_SPYRE_KV_SEMANTIC_PROBE_ENABLED", "0"))
+    ),
+    # Layer index to inspect when semantic probe logging is enabled.
+    "VLLM_SPYRE_KV_SEMANTIC_PROBE_LAYER": lambda: int(
+        os.getenv("VLLM_SPYRE_KV_SEMANTIC_PROBE_LAYER", "0")
+    ),
+    # Block index to inspect when semantic probe logging is enabled.
+    "VLLM_SPYRE_KV_SEMANTIC_PROBE_BLOCK": lambda: int(
+        os.getenv("VLLM_SPYRE_KV_SEMANTIC_PROBE_BLOCK", "0")
+    ),
+    # KV head index to inspect when semantic probe logging is enabled.
+    "VLLM_SPYRE_KV_SEMANTIC_PROBE_HEAD": lambda: int(
+        os.getenv("VLLM_SPYRE_KV_SEMANTIC_PROBE_HEAD", "0")
+    ),
+    # Number of sampled values to emit in each semantic probe log record.
+    "VLLM_SPYRE_KV_SEMANTIC_PROBE_ELEMS": lambda: int(
+        os.getenv("VLLM_SPYRE_KV_SEMANTIC_PROBE_ELEMS", "8")
     ),
 }
 # --8<-- [end:env-vars-definition]

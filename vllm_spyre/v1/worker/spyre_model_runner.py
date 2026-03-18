@@ -42,6 +42,10 @@ from vllm_spyre.model_executor.model_loader.spyre import (
 from vllm_spyre.platform import SpyrePlatform
 from vllm_spyre.utils import exact_div
 from vllm_spyre.v1.sample.spyre_logits_processor import build_logitsprocs_for_cb
+from vllm_spyre.v1.worker.spyre_kv_semantic_probe import (
+    emit_tensor_probe,
+    parse_layer_idx,
+)
 
 # yapf conflicts with ruff for this block
 # yapf: disable
@@ -746,6 +750,15 @@ class ChunkedPrefillModelRunner(
         self._connector_kv_staging = kv_staging
         self._connector_kv_pairs = kv_pairs
 
+    def _get_current_model_kv_pair(
+        self,
+        layer_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        kv_caches = getattr(self.model, "past_key_value_states", None)
+        if kv_caches is None or layer_idx < 0 or layer_idx >= len(kv_caches):
+            return None
+        return kv_caches[layer_idx]
+
     def _sync_loaded_kv_from_staging(self) -> None:
         if self._connector_kv_staging is None or self._connector_kv_pairs is None:
             return
@@ -754,9 +767,92 @@ class ChunkedPrefillModelRunner(
             kv_pair = self._connector_kv_pairs.get(layer_name)
             if kv_pair is None:
                 continue
+            layer_idx = parse_layer_idx(layer_name)
+            current_pair = (
+                None if layer_idx is None else self._get_current_model_kv_pair(layer_idx)
+            )
             k_cache, v_cache = kv_pair
+            if layer_idx is not None:
+                emit_tensor_probe(
+                    phase="before_load_sync",
+                    layer_idx=layer_idx,
+                    layer_name=layer_name,
+                    tensor_role="registered_k",
+                    tensor=k_cache,
+                    compare_to=None if current_pair is None else current_pair[0],
+                )
+                emit_tensor_probe(
+                    phase="before_load_sync",
+                    layer_idx=layer_idx,
+                    layer_name=layer_name,
+                    tensor_role="registered_v",
+                    tensor=v_cache,
+                    compare_to=None if current_pair is None else current_pair[1],
+                )
+                emit_tensor_probe(
+                    phase="before_load_sync",
+                    layer_idx=layer_idx,
+                    layer_name=layer_name,
+                    tensor_role="staging_k",
+                    tensor=kv_tensor[0],
+                )
+                emit_tensor_probe(
+                    phase="before_load_sync",
+                    layer_idx=layer_idx,
+                    layer_name=layer_name,
+                    tensor_role="staging_v",
+                    tensor=kv_tensor[1],
+                )
+                if current_pair is not None:
+                    emit_tensor_probe(
+                        phase="before_load_sync",
+                        layer_idx=layer_idx,
+                        layer_name=layer_name,
+                        tensor_role="current_model_k",
+                        tensor=current_pair[0],
+                    )
+                    emit_tensor_probe(
+                        phase="before_load_sync",
+                        layer_idx=layer_idx,
+                        layer_name=layer_name,
+                        tensor_role="current_model_v",
+                        tensor=current_pair[1],
+                    )
             k_cache.copy_(kv_tensor[0])
             v_cache.copy_(kv_tensor[1])
+            if layer_idx is not None:
+                current_pair = self._get_current_model_kv_pair(layer_idx)
+                emit_tensor_probe(
+                    phase="after_load_sync",
+                    layer_idx=layer_idx,
+                    layer_name=layer_name,
+                    tensor_role="registered_k",
+                    tensor=k_cache,
+                    compare_to=None if current_pair is None else current_pair[0],
+                )
+                emit_tensor_probe(
+                    phase="after_load_sync",
+                    layer_idx=layer_idx,
+                    layer_name=layer_name,
+                    tensor_role="registered_v",
+                    tensor=v_cache,
+                    compare_to=None if current_pair is None else current_pair[1],
+                )
+                if current_pair is not None:
+                    emit_tensor_probe(
+                        phase="after_load_sync",
+                        layer_idx=layer_idx,
+                        layer_name=layer_name,
+                        tensor_role="current_model_k",
+                        tensor=current_pair[0],
+                    )
+                    emit_tensor_probe(
+                        phase="after_load_sync",
+                        layer_idx=layer_idx,
+                        layer_name=layer_name,
+                        tensor_role="current_model_v",
+                        tensor=current_pair[1],
+                    )
 
     def _sync_fms_kv_to_staging(self) -> None:
         if self._connector_kv_staging is None or self._connector_kv_pairs is None:
@@ -766,9 +862,76 @@ class ChunkedPrefillModelRunner(
             kv_tensor = self._connector_kv_staging.get(layer_name)
             if kv_tensor is None:
                 continue
+            layer_idx = parse_layer_idx(layer_name)
+            current_pair = (
+                None if layer_idx is None else self._get_current_model_kv_pair(layer_idx)
+            )
             k_cache, v_cache = kv_pair
+            if layer_idx is not None:
+                emit_tensor_probe(
+                    phase="before_save_sync",
+                    layer_idx=layer_idx,
+                    layer_name=layer_name,
+                    tensor_role="registered_k",
+                    tensor=k_cache,
+                    compare_to=None if current_pair is None else current_pair[0],
+                )
+                emit_tensor_probe(
+                    phase="before_save_sync",
+                    layer_idx=layer_idx,
+                    layer_name=layer_name,
+                    tensor_role="registered_v",
+                    tensor=v_cache,
+                    compare_to=None if current_pair is None else current_pair[1],
+                )
+                emit_tensor_probe(
+                    phase="before_save_sync",
+                    layer_idx=layer_idx,
+                    layer_name=layer_name,
+                    tensor_role="staging_k",
+                    tensor=kv_tensor[0],
+                )
+                emit_tensor_probe(
+                    phase="before_save_sync",
+                    layer_idx=layer_idx,
+                    layer_name=layer_name,
+                    tensor_role="staging_v",
+                    tensor=kv_tensor[1],
+                )
+                if current_pair is not None:
+                    emit_tensor_probe(
+                        phase="before_save_sync",
+                        layer_idx=layer_idx,
+                        layer_name=layer_name,
+                        tensor_role="current_model_k",
+                        tensor=current_pair[0],
+                    )
+                    emit_tensor_probe(
+                        phase="before_save_sync",
+                        layer_idx=layer_idx,
+                        layer_name=layer_name,
+                        tensor_role="current_model_v",
+                        tensor=current_pair[1],
+                    )
             kv_tensor[0].copy_(k_cache)
             kv_tensor[1].copy_(v_cache)
+            if layer_idx is not None:
+                emit_tensor_probe(
+                    phase="after_save_sync",
+                    layer_idx=layer_idx,
+                    layer_name=layer_name,
+                    tensor_role="staging_k",
+                    tensor=kv_tensor[0],
+                    compare_to=k_cache,
+                )
+                emit_tensor_probe(
+                    phase="after_save_sync",
+                    layer_idx=layer_idx,
+                    layer_name=layer_name,
+                    tensor_role="staging_v",
+                    tensor=kv_tensor[1],
+                    compare_to=v_cache,
+                )
 
     @property
     def vocab_size(self) -> int:
