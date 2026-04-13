@@ -22,8 +22,23 @@ if TYPE_CHECKING:
     VLLM_SPYRE_MODEL_CONFIG_FILE: str | None = None
     VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE: bool = False
     VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE: int = 1024
+    VLLM_SPYRE_KV_STORE_BACKEND: str = "host_memory"
     VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS: int = 0
     VLLM_SPYRE_KV_STORE_MAX_BYTES: int = 0
+    VLLM_SPYRE_KV_SERVICE_SOCKET: str = "/tmp/spyre-kv-persistent.sock"
+    VLLM_SPYRE_EXPERIMENTAL_HEAP_KV_ENABLE: bool = False
+    VLLM_SPYRE_EXPERIMENTAL_HEAP_KV_STRICT: bool = False
+    VLLM_SPYRE_HEAP_KV_PERFDSC_DIR: str = ""
+    VLLM_SPYRE_HEAP_KV_EXPORT_DIR: str = ""
+    VLLM_SPYRE_HEAP_KV_DTI_ROOT: str = ""
+    VLLM_SPYRE_HEAP_KV_DEV_ENV_SCRIPT: str = ""
+    VLLM_SPYRE_HEAP_KV_HELPER_TIMEOUT_S: int = 300
+    VLLM_SPYRE_KV_PLACEMENT_PROBE_ENABLED: bool = False
+    VLLM_SPYRE_KV_SEMANTIC_PROBE_ENABLED: bool = False
+    VLLM_SPYRE_KV_SEMANTIC_PROBE_LAYER: int = 0
+    VLLM_SPYRE_KV_SEMANTIC_PROBE_BLOCK: int = 0
+    VLLM_SPYRE_KV_SEMANTIC_PROBE_HEAD: int = 0
+    VLLM_SPYRE_KV_SEMANTIC_PROBE_ELEMS: int = 8
 
 logger = init_logger(__name__)
 
@@ -153,6 +168,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE": lambda: int(
         os.getenv("VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE", "1024")
     ),
+    # KV store backend used by the Spyre connector. This is the main switch
+    # between plain host memory and the serialized/shared-memory service lanes.
+    "VLLM_SPYRE_KV_STORE_BACKEND": lambda: os.getenv(
+        "VLLM_SPYRE_KV_STORE_BACKEND", "host_memory"
+    ),
     # Number of worker threads for async per-layer KV load in the connector.
     # When > 0, start_load_kv submits per-layer loads to a ThreadPoolExecutor
     # and wait_for_layer_load blocks on individual futures. When 0 (default),
@@ -166,6 +186,54 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to 0 for unlimited (count-based eviction only via registry cap).
     "VLLM_SPYRE_KV_STORE_MAX_BYTES": lambda: int(
         os.getenv("VLLM_SPYRE_KV_STORE_MAX_BYTES", "0")
+    ),
+    # Socket path for the persistent local KV service. Only used with the
+    # serialized_shared_memory_service backend.
+    "VLLM_SPYRE_KV_SERVICE_SOCKET": lambda: os.getenv(
+        "VLLM_SPYRE_KV_SERVICE_SOCKET", "/tmp/spyre-kv-persistent.sock"
+    ),
+    # Experimental old-stack heap-backed KV block IO.
+    "VLLM_SPYRE_EXPERIMENTAL_HEAP_KV_ENABLE": lambda: bool(
+        int(os.getenv("VLLM_SPYRE_EXPERIMENTAL_HEAP_KV_ENABLE", "0"))
+    ),
+    # Fail fast instead of silently falling back to staging if heap KV cannot
+    # initialize.
+    "VLLM_SPYRE_EXPERIMENTAL_HEAP_KV_STRICT": lambda: bool(
+        int(os.getenv("VLLM_SPYRE_EXPERIMENTAL_HEAP_KV_STRICT", "0"))
+    ),
+    "VLLM_SPYRE_HEAP_KV_PERFDSC_DIR": lambda: os.getenv(
+        "VLLM_SPYRE_HEAP_KV_PERFDSC_DIR", ""
+    ),
+    "VLLM_SPYRE_HEAP_KV_EXPORT_DIR": lambda: os.getenv(
+        "VLLM_SPYRE_HEAP_KV_EXPORT_DIR", ""
+    ),
+    "VLLM_SPYRE_HEAP_KV_DTI_ROOT": lambda: os.getenv(
+        "VLLM_SPYRE_HEAP_KV_DTI_ROOT", ""
+    ),
+    "VLLM_SPYRE_HEAP_KV_DEV_ENV_SCRIPT": lambda: os.getenv(
+        "VLLM_SPYRE_HEAP_KV_DEV_ENV_SCRIPT", ""
+    ),
+    "VLLM_SPYRE_HEAP_KV_HELPER_TIMEOUT_S": lambda: int(
+        os.getenv("VLLM_SPYRE_HEAP_KV_HELPER_TIMEOUT_S", "300")
+    ),
+    # Probe toggles used by the old-stack semantic validation lane.
+    "VLLM_SPYRE_KV_PLACEMENT_PROBE_ENABLED": lambda: bool(
+        int(os.getenv("VLLM_SPYRE_KV_PLACEMENT_PROBE_ENABLED", "0"))
+    ),
+    "VLLM_SPYRE_KV_SEMANTIC_PROBE_ENABLED": lambda: bool(
+        int(os.getenv("VLLM_SPYRE_KV_SEMANTIC_PROBE_ENABLED", "0"))
+    ),
+    "VLLM_SPYRE_KV_SEMANTIC_PROBE_LAYER": lambda: int(
+        os.getenv("VLLM_SPYRE_KV_SEMANTIC_PROBE_LAYER", "0")
+    ),
+    "VLLM_SPYRE_KV_SEMANTIC_PROBE_BLOCK": lambda: int(
+        os.getenv("VLLM_SPYRE_KV_SEMANTIC_PROBE_BLOCK", "0")
+    ),
+    "VLLM_SPYRE_KV_SEMANTIC_PROBE_HEAD": lambda: int(
+        os.getenv("VLLM_SPYRE_KV_SEMANTIC_PROBE_HEAD", "0")
+    ),
+    "VLLM_SPYRE_KV_SEMANTIC_PROBE_ELEMS": lambda: int(
+        os.getenv("VLLM_SPYRE_KV_SEMANTIC_PROBE_ELEMS", "8")
     ),
 }
 # --8<-- [end:env-vars-definition]

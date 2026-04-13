@@ -43,10 +43,19 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm_spyre.distributed.kv_transfer.kv_connector.v1.metadata import (
     InMemoryKVStore,
     KVKind,
+    SavedRequestRecord,
     SpyreConnectorMeta,
     SpyreConnectorRequestMeta,
     SpyreConnectorStats,
+    SpyreKVStoreBackend,
     StoreKey,
+    build_spyre_kv_store_backend,
+)
+from vllm_spyre.distributed.kv_transfer.kv_connector.v1.heap_kv_accessor import (
+    resolve_heap_kv_paths,
+)
+from vllm_spyre.distributed.kv_transfer.kv_connector.v1.heap_kv_inprocess_client import (
+    InProcessHeapKVClient,
 )
 
 if TYPE_CHECKING:
@@ -64,24 +73,35 @@ logger = logging.getLogger(__name__)
 # Global store (can be replaced for testing)
 # ---------------------------------------------------------------------------
 
-_GLOBAL_STORE: InMemoryKVStore | None = None
+_GLOBAL_STORE: SpyreKVStoreBackend | None = None
 
 
-def get_global_store() -> InMemoryKVStore:
+def _build_configured_store(
+    store_backend_name: str | None = None,
+) -> SpyreKVStoreBackend:
+    backend_name = store_backend_name or envs_spyre.VLLM_SPYRE_KV_STORE_BACKEND
+    return build_spyre_kv_store_backend(
+        backend_name,
+        max_bytes=envs_spyre.VLLM_SPYRE_KV_STORE_MAX_BYTES,
+        max_saved_requests=envs_spyre.VLLM_SPYRE_KV_REUSE_REGISTRY_MAX_SIZE,
+        service_socket=envs_spyre.VLLM_SPYRE_KV_SERVICE_SOCKET,
+    )
+
+
+def get_global_store(
+    store_backend_name: str | None = None,
+) -> SpyreKVStoreBackend:
     global _GLOBAL_STORE
     if _GLOBAL_STORE is None:
-        max_bytes = envs_spyre.VLLM_SPYRE_KV_STORE_MAX_BYTES
-        _GLOBAL_STORE = InMemoryKVStore(max_bytes=max_bytes)
+        _GLOBAL_STORE = _build_configured_store(store_backend_name)
     return _GLOBAL_STORE
 
 
-def reset_global_store() -> None:
+def reset_global_store(store_backend_name: str | None = None) -> None:
     global _GLOBAL_STORE
     if _GLOBAL_STORE is not None:
-        _GLOBAL_STORE.clear()
-    else:
-        max_bytes = envs_spyre.VLLM_SPYRE_KV_STORE_MAX_BYTES
-        _GLOBAL_STORE = InMemoryKVStore(max_bytes=max_bytes)
+        _GLOBAL_STORE.shutdown()
+    _GLOBAL_STORE = _build_configured_store(store_backend_name)
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +257,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         vllm_config: VllmConfig,
         role: KVConnectorRole,
         kv_cache_config: KVCacheConfig | None = None,
-        store: InMemoryKVStore | None = None,
+        store: SpyreKVStoreBackend | None = None,
     ):
         super().__init__(
             vllm_config=vllm_config,
@@ -288,6 +308,13 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         # Per-interval stats (reset each time stats are collected)
         self._stats = SpyreConnectorStats()
 
+        self._use_heap_kv = bool(envs_spyre.VLLM_SPYRE_EXPERIMENTAL_HEAP_KV_ENABLE)
+        self._heap_kv_strict = bool(
+            envs_spyre.VLLM_SPYRE_EXPERIMENTAL_HEAP_KV_STRICT
+        )
+        self._heap_kv_client: InProcessHeapKVClient | None = None
+        self._heap_kv_init_error: str | None = None
+
         # Async layer pipeline.
         # When _async_load_enabled is True, per-layer loads are submitted
         # to a thread pool and wait_for_layer_load() blocks on futures.
@@ -310,6 +337,116 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             self._role_name, self._block_size,
             self._async_load_enabled, self._async_load_workers,
         )
+
+    def _prune_saved_request(self, req_id: str, *, remove_store: bool = False) -> bool:
+        if self._store.has_persistent_saved_requests():
+            removed = self._store.remove_saved_request(req_id)
+        else:
+            removed = self._saved_requests.pop(req_id, None) is not None
+        if remove_store:
+            self._store.remove_by_req(req_id)
+        return removed
+
+    def _load_saved_requests(self) -> list[_SavedRequest]:
+        if not self._store.has_persistent_saved_requests():
+            return list(self._saved_requests.values())
+
+        records = [
+            _SavedRequest(
+                req_id=str(record.req_id),
+                prompt_token_ids=tuple(record.prompt_token_ids),
+                block_ids=list(record.block_ids),
+                num_tokens=int(record.num_tokens),
+            )
+            for record in self._store.get_saved_requests()
+        ]
+        self._saved_requests = OrderedDict((record.req_id, record) for record in records)
+        return records
+
+    def _save_request_record(self, record: _SavedRequest) -> None:
+        if self._store.has_persistent_saved_requests():
+            self._store.save_request_record(
+                SavedRequestRecord(
+                    req_id=record.req_id,
+                    prompt_token_ids=tuple(record.prompt_token_ids),
+                    block_ids=list(record.block_ids),
+                    num_tokens=record.num_tokens,
+                )
+            )
+            self._load_saved_requests()
+            return
+
+        if record.req_id in self._saved_requests:
+            self._saved_requests.move_to_end(record.req_id)
+        self._saved_requests[record.req_id] = record
+
+        if self._saved_requests_max_size > 0:
+            while len(self._saved_requests) > self._saved_requests_max_size:
+                oldest_req_id, _ = self._saved_requests.popitem(last=False)
+                self._store.remove_by_req(oldest_req_id)
+                self._stats.record("evictions")
+
+    def _saved_request_count(self) -> int:
+        if self._store.has_persistent_saved_requests():
+            return self._store.saved_request_count()
+        return len(self._saved_requests)
+
+    @property
+    def uses_heap_kv(self) -> bool:
+        return self._use_heap_kv
+
+    def heap_kv_active(self) -> bool:
+        return self._ensure_heap_kv_client() is not None
+
+    def get_heap_kv_status(self) -> dict[str, Any]:
+        active = self._heap_kv_client is not None
+        return {
+            "requested": bool(self._use_heap_kv),
+            "strict": bool(self._heap_kv_strict),
+            "active": active,
+            "mode": "in_process" if active else None,
+            "init_error": self._heap_kv_init_error,
+        }
+
+    def _ensure_heap_kv_client(self) -> InProcessHeapKVClient | None:
+        if not self._use_heap_kv:
+            return None
+        if self._heap_kv_client is not None:
+            return self._heap_kv_client
+
+        try:
+            if not self._kv_caches:
+                raise RuntimeError(
+                    "KV cache geometry is unavailable before register_kv_caches"
+                )
+            first_tensor = next(iter(self._kv_caches.values()))
+            perfdsc_dir, export_dir = resolve_heap_kv_paths(
+                perfdsc_dir=envs_spyre.VLLM_SPYRE_HEAP_KV_PERFDSC_DIR or None,
+                export_dir=envs_spyre.VLLM_SPYRE_HEAP_KV_EXPORT_DIR or None,
+            )
+            client = InProcessHeapKVClient(
+                kv_heads=self._num_kv_heads,
+                block_size=self._block_size,
+                head_dim=self._head_dim,
+                dtype=first_tensor.dtype,
+                perfdsc_dir=perfdsc_dir,
+                export_dir=export_dir,
+            )
+            self._heap_kv_client = client
+            return self._heap_kv_client
+        except Exception as exc:
+            self._heap_kv_init_error = f"{type(exc).__name__}: {exc}"
+            if self._heap_kv_strict:
+                raise RuntimeError(
+                    "Experimental in-process heap KV strict mode is enabled and "
+                    f"initialization failed: {self._heap_kv_init_error}"
+                ) from exc
+            logger.warning(
+                "[InMemorySpyreConnector] Experimental in-process heap KV unavailable, "
+                "falling back to staging path: %s",
+                self._heap_kv_init_error,
+            )
+            return None
 
     # ------------------------------------------------------------------
     # Worker-side: KV cache registration
@@ -373,7 +510,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
     ) -> None:
         """Load KV cache blocks from the store into staging tensors.
 
-        When async loading is enabled (VLLM_SPYRE_MAX_LOAD_PROCESSES > 0),
+        When async loading is enabled (VLLM_SPYRE_KV_ASYNC_LOAD_WORKERS > 0),
         per-layer loads are submitted to a thread pool and
         wait_for_layer_load() blocks on the individual layer's future.
 
@@ -392,7 +529,20 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         self._layer_load_futures.clear()
         self._load_error_block_ids.clear()
 
-        if self._async_load_enabled and self._executor is not None:
+        total_load = 0
+        total_miss = 0
+        has_load_requests = any(not req_meta.is_store for req_meta in meta.requests)
+        heap_client = self._ensure_heap_kv_client() if has_load_requests else None
+
+        if heap_client is not None:
+            total_load, total_miss = self._load_via_heap_helper(meta, heap_client)
+            for layer_name in self._layer_names:
+                self._layer_load_done[layer_name] = True
+            self._blocks_loaded += total_load
+            self._blocks_missing += total_miss
+            self._stats.record("loaded_blocks", total_load)
+            self._stats.record("load_misses", total_miss)
+        elif self._async_load_enabled and self._executor is not None:
             # Async path: submit per-layer loads to thread pool.
             for layer_idx, layer_name in enumerate(self._layer_names):
                 future = self._executor.submit(
@@ -401,9 +551,6 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                 self._layer_load_futures[layer_name] = future
         else:
             # Sync path: load all layers sequentially.
-            total_load = 0
-            total_miss = 0
-
             for layer_idx, layer_name in enumerate(self._layer_names):
                 layer_load, layer_miss = self._load_layer(
                     meta, layer_idx, layer_name,
@@ -474,19 +621,67 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                         block_id=src_block_id,
                         kv_kind=kv_kind,
                     )
-                    entry = self._store.get(store_key)
-                    if entry is None:
-                        miss_count += 1
-                        self._load_error_block_ids.add(dest_bid)
-                        continue
-
                     try:
-                        staging[kv_dim][dest_bid].copy_(entry.data)
-                        load_count += 1
+                        loaded = self._store.load_into(
+                            store_key, staging[kv_dim][dest_bid]
+                        )
                     except RuntimeError:
+                        loaded = False
+
+                    if loaded:
+                        load_count += 1
+                    else:
                         miss_count += 1
                         self._load_error_block_ids.add(dest_bid)
 
+        return load_count, miss_count
+
+    def _load_via_heap_helper(
+        self,
+        meta: SpyreConnectorMeta,
+        heap_client: InProcessHeapKVClient,
+    ) -> tuple[int, int]:
+        block_values: dict[tuple[int, str, int], torch.Tensor] = {}
+        load_count = 0
+        miss_count = 0
+        dtype = next(iter(self._kv_caches.values())).dtype
+
+        for req_meta in meta.requests:
+            if req_meta.is_store:
+                continue
+
+            source_req = req_meta.source_req_id or req_meta.req_id
+            mapping = (
+                list(req_meta.block_mapping)
+                if req_meta.block_mapping
+                else [(block_id, block_id) for block_id in req_meta.block_ids]
+            )
+
+            for src_block_id, dest_bid in mapping:
+                for layer_idx in range(self._num_layers):
+                    for kv_kind in (KVKind.K, KVKind.V):
+                        store_key = StoreKey(
+                            req_id=source_req,
+                            layer_idx=layer_idx,
+                            block_id=src_block_id,
+                            kv_kind=kv_kind,
+                        )
+                        cpu_block = torch.empty(
+                            (self._block_size, self._num_kv_heads, self._head_dim),
+                            dtype=dtype,
+                            device="cpu",
+                        )
+                        if self._store.load_into(store_key, cpu_block):
+                            block_values[
+                                (layer_idx, kv_kind.value.lower(), dest_bid)
+                            ] = cpu_block
+                            load_count += 1
+                        else:
+                            miss_count += 1
+                            self._load_error_block_ids.add(dest_bid)
+
+        if block_values:
+            heap_client.write_blocks(block_values)
         return load_count, miss_count
 
     # ------------------------------------------------------------------
@@ -517,14 +712,26 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             return
 
         save_count = 0
+        heap_client = self._ensure_heap_kv_client()
 
         for req_meta in meta.requests:
             if not req_meta.is_store:
                 continue
 
+            heap_blocks: dict[tuple[int, str, int], torch.Tensor] = {}
+            if heap_client is not None:
+                block_refs = [
+                    (layer_idx, kv_kind.value.lower(), block_id)
+                    for layer_idx in range(self._num_layers)
+                    for block_id in req_meta.block_ids
+                    for kv_kind in (KVKind.K, KVKind.V)
+                ]
+                if block_refs:
+                    heap_blocks = heap_client.read_blocks(block_refs)
+
             for layer_idx, layer_name in enumerate(self._layer_names):
                 staging = self._kv_caches.get(layer_name)
-                if staging is None:
+                if staging is None and not heap_blocks:
                     continue
 
                 for block_id in req_meta.block_ids:
@@ -535,9 +742,16 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                             block_id=block_id,
                             kv_kind=kv_kind,
                         )
+                        if heap_blocks:
+                            cpu_block = heap_blocks[
+                                (layer_idx, kv_kind.value.lower(), block_id)
+                            ]
+                        else:
+                            assert staging is not None
+                            cpu_block = staging[kv_dim][block_id]
                         self._store.put(
                             store_key,
-                            staging[kv_dim][block_id],
+                            cpu_block,
                             source_req=req_meta.req_id,
                         )
                         save_count += 1
@@ -640,7 +854,8 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
               - is_async: always False (synchronous loading)
         """
         prompt = request.prompt_token_ids
-        if not prompt or not self._saved_requests:
+        saved_requests = self._load_saved_requests()
+        if not prompt or not saved_requests:
             self._pending_load_sources.pop(request.request_id, None)
             self._stats.record("match_attempts")
             return 0, False
@@ -648,40 +863,51 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         prompt_tuple = tuple(prompt)
         best_match: _SavedRequest | None = None
         best_tokens_total = 0
+        stale_request_ids: list[str] = []
 
-        for saved in self._saved_requests.values():
+        for saved in saved_requests:
             saved_len = len(saved.prompt_token_ids)
             if saved_len == 0:
                 continue
 
-            # Compute common prefix length between saved and new prompts.
-            # Either saved is a prefix of new, or new is a prefix of saved,
-            # or they share a common prefix that's shorter than both.
-            common_len = min(saved_len, len(prompt_tuple))
-            if prompt_tuple[:common_len] != saved.prompt_token_ids[:common_len]:
+            available_blocks = self._store.available_prefix_blocks(
+                saved.req_id,
+                saved.block_ids,
+            )
+            if available_blocks < len(saved.block_ids):
+                stale_request_ids.append(saved.req_id)
                 continue
 
-            # Block-align: round down to block_size boundary
+            common_len = 0
+            for prompt_token, saved_token in zip(
+                prompt_tuple, saved.prompt_token_ids
+            ):
+                if prompt_token != saved_token:
+                    break
+                common_len += 1
+
             aligned = (common_len // self._block_size) * self._block_size
-            if aligned == 0:
-                continue
-
             if aligned > best_tokens_total:
                 best_tokens_total = aligned
                 best_match = saved
 
+        for req_id in stale_request_ids:
+            self._prune_saved_request(req_id, remove_store=True)
+
         if best_match is not None and best_tokens_total > 0:
-            # Return only the additional tokens beyond what is already local.
-            # Keep this conservative and block-aligned to avoid over-reporting.
             num_local = max(0, num_computed_tokens)
-            num_external = max(0, best_tokens_total - num_local)
+            if best_tokens_total >= len(prompt_tuple):
+                target_total_computed = max(0, len(prompt_tuple) - 1)
+                num_external = max(0, target_total_computed - num_local)
+            else:
+                num_external = max(0, best_tokens_total - num_local)
             num_external = (num_external // self._block_size) * self._block_size
 
             if num_external == 0:
                 self._pending_load_sources.pop(request.request_id, None)
+                self._stats.record("match_attempts")
                 return 0, False
 
-            # Record match context for update_state_after_alloc.
             self._pending_load_sources[request.request_id] = _PendingLoadSource(
                 source=best_match,
                 matched_tokens_total=best_tokens_total,
@@ -856,40 +1082,53 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         """
         prompt = request.prompt_token_ids
         if prompt and block_ids:
+            num_prompt_blocks = (len(prompt) + self._block_size - 1) // self._block_size
+            prompt_block_ids = list(block_ids[:num_prompt_blocks])
+            if not prompt_block_ids:
+                logger.info(
+                    "[InMemorySpyreConnector] request_finished req=%s prompt_tokens=%d "
+                    "received no prompt block ids from %s",
+                    request.request_id,
+                    len(prompt),
+                    block_ids,
+                )
+                return False, None
+
+            available_blocks = self._store.available_prefix_blocks(
+                request.request_id,
+                prompt_block_ids,
+            )
+            if available_blocks < len(prompt_block_ids):
+                logger.info(
+                    "[InMemorySpyreConnector] request_finished prune req=%s "
+                    "prompt_tokens=%d block_ids=%s prompt_block_ids=%s "
+                    "available_blocks=%d store_stats=%s",
+                    request.request_id,
+                    len(prompt),
+                    block_ids,
+                    prompt_block_ids,
+                    available_blocks,
+                    self._store.stats(),
+                )
+                self._store.remove_by_req(request.request_id)
+                return False, None
+
             saved = _SavedRequest(
                 req_id=request.request_id,
                 prompt_token_ids=tuple(prompt),
-                block_ids=list(block_ids),
+                block_ids=prompt_block_ids,
                 num_tokens=len(prompt),
             )
-            # If already present, move to end (most-recently-used).
-            if request.request_id in self._saved_requests:
-                self._saved_requests.move_to_end(request.request_id)
-            self._saved_requests[request.request_id] = saved
-
-            # Evict oldest entries if over the cap (0 = unlimited).
-            if self._saved_requests_max_size > 0:
-                while len(self._saved_requests) > self._saved_requests_max_size:
-                    evicted_id, _ = self._saved_requests.popitem(last=False)
-                    self._stats.record("evictions")
-                    logger.debug(
-                        "[InMemorySpyreConnector] Evicted saved request %s "
-                        "(registry at cap %d)",
-                        evicted_id, self._saved_requests_max_size,
-                    )
-
-            logger.debug(
-                "[InMemorySpyreConnector] request_finished: req=%s saved "
-                "(%d tokens, %d blocks) for reuse, registry_size=%d",
-                request.request_id, len(prompt), len(block_ids),
-                len(self._saved_requests),
+            self._save_request_record(saved)
+            logger.info(
+                "[InMemorySpyreConnector] request_finished saved req=%s "
+                "prompt_tokens=%d prompt_block_ids=%s store_stats=%s",
+                request.request_id,
+                len(prompt),
+                prompt_block_ids,
+                self._store.stats(),
             )
-        else:
-            logger.debug(
-                "[InMemorySpyreConnector] request_finished: req=%s, "
-                "%d blocks (not saved — no prompt or blocks)",
-                request.request_id, len(block_ids),
-            )
+
         return False, None
 
     # ------------------------------------------------------------------
@@ -937,14 +1176,14 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             "blocks_saved": self._blocks_saved,
             "blocks_loaded": self._blocks_loaded,
             "blocks_missing": self._blocks_missing,
-            "saved_requests_count": len(self._saved_requests),
+            "saved_requests_count": self._saved_request_count(),
         }
 
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
 
-    def get_store(self) -> InMemoryKVStore:
+    def get_store(self) -> SpyreKVStoreBackend:
         """Return the underlying store (for testing/inspection)."""
         return self._store
 
@@ -953,6 +1192,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         if self._executor is not None:
             self._executor.shutdown(wait=True)
             self._executor = None
+        self._store.shutdown()
         logger.info(
             "[InMemorySpyreConnector] Shutdown. Store stats: %s",
             self._store.stats(),

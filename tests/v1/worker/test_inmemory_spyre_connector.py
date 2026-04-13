@@ -827,7 +827,7 @@ class TestVersionCompat:
         old_checked = compat_mod._compat_checked
         compat_mod._compat_checked = False
         try:
-            # Should not raise for vllm 0.15.x
+            # Should not raise for one of the supported experimental bands.
             check_vllm_version()
         finally:
             compat_mod._compat_checked = old_checked
@@ -842,9 +842,12 @@ class TestVersionCompat:
         try:
             with patch(
                 "importlib.metadata.version",
-                side_effect=["0.16.0", "0.15.1"],
+                side_effect=["0.16.0", "0.17.0"],
             ):
-                with pytest.raises(RuntimeError, match="requires vllm>=0.15.0,<0.16.0"):
+                with pytest.raises(
+                    RuntimeError,
+                    match="requires one of: vllm>=0.15.0,<0.16.0, vllm>=0.17.0,<0.17.2",
+                ):
                     check_vllm_version()
 
                 # Should re-run and pass on second attempt.

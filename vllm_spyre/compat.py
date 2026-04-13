@@ -12,11 +12,13 @@ import os
 
 logger = logging.getLogger(__name__)
 
-# The vLLM version band that this release of vllm-spyre targets.
-# Format: (min_version_inclusive, max_version_exclusive)
-# For PR-759 work: we target vllm 0.15.x
-VLLM_MIN_VERSION = "0.15.0"
-VLLM_MAX_VERSION = "0.16.0"
+# Supported vLLM version bands for this experimental branch.
+# We keep the original 0.15.x lane for source-based development and allow the
+# 0.17.x pod/image lane used by the current heap-KV experiments.
+SUPPORTED_VLLM_VERSION_BANDS = (
+    ("0.15.0", "0.16.0"),
+    ("0.17.0", "0.17.2"),
+)
 
 _compat_checked = False
 
@@ -76,19 +78,28 @@ def check_vllm_version() -> None:
         return
 
     installed = _parse_version_tuple(vllm_version)
-    min_ver = _parse_version_tuple(VLLM_MIN_VERSION)
-    max_ver = _parse_version_tuple(VLLM_MAX_VERSION)
+    supported_bands = [
+        (_parse_version_tuple(min_ver), _parse_version_tuple(max_ver), min_ver, max_ver)
+        for min_ver, max_ver in SUPPORTED_VLLM_VERSION_BANDS
+    ]
 
-    if installed < min_ver or installed >= max_ver:
+    if not any(min_ver <= installed < max_ver for min_ver, max_ver, _, _ in supported_bands):
+        supported = ", ".join(
+            f"vllm>={min_ver},<{max_ver}"
+            for _, _, min_ver, max_ver in supported_bands
+        )
         msg = (
-            f"vllm-spyre requires vllm>={VLLM_MIN_VERSION},<{VLLM_MAX_VERSION} "
+            f"vllm-spyre requires one of: {supported} "
             f"but found vllm=={vllm_version}. "
             f"Set VLLM_SPYRE_SKIP_VERSION_CHECK=1 to bypass this check."
         )
         raise RuntimeError(msg)
 
     logger.debug(
-        "vLLM version check passed: %s (band %s–%s)",
-        vllm_version, VLLM_MIN_VERSION, VLLM_MAX_VERSION,
+        "vLLM version check passed: %s (supported bands: %s)",
+        vllm_version,
+        ", ".join(
+            f"{min_ver}–{max_ver}" for min_ver, max_ver in SUPPORTED_VLLM_VERSION_BANDS
+        ),
     )
     _compat_checked = True

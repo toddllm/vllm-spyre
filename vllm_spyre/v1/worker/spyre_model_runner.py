@@ -1677,7 +1677,8 @@ class ChunkedPrefillModelRunner(
                     # start_load_kv writes into separate connector staging
                     # buffers. Copy any loaded values into the live FMS K/V
                     # tensors before forward executes.
-                    self._sync_loaded_kv_from_staging()
+                    if not self._kv_bridge.uses_heap_kv:
+                        self._sync_loaded_kv_from_staging()
 
                 logits = self.model(
                     input_ids_or_embeds=input_ids_or_embeds,
@@ -1692,7 +1693,8 @@ class ChunkedPrefillModelRunner(
                 # connector staging buffers. Copy those updates back into
                 # staging before post-forward connector calls
                 # (save/wait/finished).
-                self._sync_fms_kv_to_staging()
+                if not self._kv_bridge.uses_heap_kv:
+                    self._sync_fms_kv_to_staging()
                 self._kv_bridge.after_forward(scheduler_output)
 
             # If the prompt is being prefilled we don't have to sample

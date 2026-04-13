@@ -98,6 +98,20 @@ class SpyreKVConnectorBridge:
         )
         return True
 
+    @property
+    def is_available(self) -> bool:
+        return self._kv_connector is not None or self._try_acquire_connector()
+
+    @property
+    def uses_heap_kv(self) -> bool:
+        if not self.is_available:
+            return False
+        assert self._kv_connector is not None
+        active_fn = getattr(self._kv_connector, "heap_kv_active", None)
+        if callable(active_fn):
+            return bool(active_fn())
+        return bool(getattr(self._kv_connector, "uses_heap_kv", False))
+
     def begin_step(
         self,
         scheduler_output: "SchedulerOutput",
@@ -114,7 +128,7 @@ class SpyreKVConnectorBridge:
 
         # Acquire the connector lazily at step time. This is the only
         # acquisition point for the bridge.
-        if not self._try_acquire_connector():
+        if not self.is_available:
             return False
 
         assert self._kv_connector is not None
